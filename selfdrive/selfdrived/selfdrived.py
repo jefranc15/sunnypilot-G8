@@ -472,6 +472,21 @@ class SelfdriveD(CruiseHelper):
     if CS.gearShifter == car.CarState.GearShifter.park and self.mads.enabled:
       self.events.remove(EventName.canBusMissing)
 
+    # G8_DUMMY_ALERT_BYPASS_V1
+    # Bench-only alert muting. Requiring NOBOARD plus the dummy fingerprint prevents
+    # this path from activating during normal real-car operation.
+    g8_dummy_bench = (
+      os.getenv("G8_DUMMY_ALLOW_ONROAD") == "1"
+      and os.getenv("NOBOARD") == "1"
+      and os.getenv("FINGERPRINT") == "HONDA_E"
+    )
+    if g8_dummy_bench:
+      self.events.remove(EventName.canBusMissing)
+      self.events.remove(EventName.canError)
+      self.events.remove(EventName.calibrationIncomplete)
+      self.events.remove(EventName.calibrationInvalid)
+      self.events.remove(EventName.calibrationRecalibrating)
+
     CruiseHelper.update(self, CS, self.events_sp, self.experimental_mode)
 
     # decrement personality on distance button press

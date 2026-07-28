@@ -1,0 +1,21 @@
+[Unit]
+Description=LG G8 convert native USB serial gadget to ADB
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-magic.service g8-openpilot.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+ExecStartPre=/usr/bin/touch /data/g8-adb-unit.started
+ExecStart=/usr/comma/g8-adb-convert.sh
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+StandardOutput=append:/data/g8-adb-convert.log
+StandardError=append:/data/g8-adb-convert.log
+
+[Install]
+WantedBy=multi-user.target

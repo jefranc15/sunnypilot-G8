@@ -44,6 +44,9 @@ else:
   tg_backend = 'CPU'
   tg_flags = f'DEV=CPU' if arch == 'Darwin' else 'DEV=CPU:LLVM'
 
+if os.environ.get("G8_AGNOS"):
+  tg_flags += " CACHEDB=/data/tinygrad-cache/cache.db"
+
 tg_devices = { # which device to put jit inputs to at runtime
   'selfdrive.modeld.modeld': {
     'default': {'WARP_DEV': tg_backend, 'QUEUE_DEV': tg_backend},

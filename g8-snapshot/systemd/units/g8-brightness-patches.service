@@ -1,0 +1,11 @@
+[Unit]
+Description=LG G8 persistent brightness source patches
+After=g8-seed-sunnypilot.service g8-openpilot-patches.service
+Before=g8-openpilot.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/venv/bin/python3 /data/g8-persistent/g8-brightness-patches.py
+StandardOutput=append:/data/g8-brightness-patches.log
+StandardError=append:/data/g8-brightness-patches.log

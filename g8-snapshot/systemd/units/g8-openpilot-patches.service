@@ -1,0 +1,15 @@
+[Unit]
+Description=LG G8 persistent sunnypilot sensor/UI patch guard
+Requires=g8-seed-sunnypilot.service
+After=g8-seed-sunnypilot.service
+Before=g8-openpilot.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/venv/bin/python3 /data/g8-persistent/g8-openpilot-patches.py
+StandardOutput=append:/data/g8-openpilot-patches.log
+StandardError=append:/data/g8-openpilot-patches.log
+
+[Install]
+WantedBy=multi-user.target

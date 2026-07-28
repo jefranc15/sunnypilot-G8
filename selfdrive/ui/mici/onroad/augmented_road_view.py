@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pyray as rl
 from cereal import car, log
@@ -183,10 +184,15 @@ class AugmentedRoadView(CameraView):
       super()._handle_mouse_release(mouse_pos)
 
   def _render(self, _):
-    # Draw text if not onroad
+    # G8 camera integration test: reuse the already-running normal UI/EGL
+    # context instead of opening a second GBM surface. The flag is checked
+    # every frame, so removing it immediately restores the normal offroad UI.
     if not ui_state.started:
-      rl.draw_rectangle_rec(self.rect, rl.BLACK)
-      self._offroad_label.render(self._rect)
+      if os.path.exists("/data/G8_CAMERA_UI_TEST"):
+        super()._render(self.rect)
+      else:
+        rl.draw_rectangle_rec(self.rect, rl.BLACK)
+        self._offroad_label.render(self._rect)
       return
 
     self._switch_stream_if_needed(ui_state.sm)
@@ -287,6 +293,12 @@ class AugmentedRoadView(CameraView):
       self.view_from_wide_calib = view_frame_from_device_frame @ wide_from_device @ device_from_calib
 
   def _calc_frame_matrix(self, rect: rl.Rectangle) -> np.ndarray:
+    # For the controlled G8 offroad test, use CameraView's simple aspect-fit
+    # transform. This avoids applying comma-device intrinsics/calibration to
+    # the LG IMX363 before we have a proper G8 DeviceCameraConfig.
+    if os.path.exists("/data/G8_CAMERA_UI_TEST"):
+      return CameraView._calc_frame_matrix(self, rect)
+
     cache_key = (
       ui_state.sm.recv_frame['liveCalibration'],
       int(self._content_rect.width),

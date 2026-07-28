@@ -1,0 +1,14 @@
+[Unit]
+Description=LG G8 qcwlanstate ON request
+Requires=g8-lg-cnss.service
+After=g8-lg-cnss.service
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/comma/g8-lg-qcwlan-on.sh
+RemainAfterExit=yes
+TimeoutStartSec=70
+
+[Install]
+WantedBy=multi-user.target

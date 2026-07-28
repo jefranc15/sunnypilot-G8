@@ -1,0 +1,14 @@
+[Unit]
+Description=LG G8 temporary WLAN kernel log capture
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-lg-cnss.service g8-lg-qcwlan-on.service
+
+[Service]
+Type=simple
+ExecStart=/bin/dmesg -w
+StandardOutput=append:/data/g8-kmsg-wifi.log
+StandardError=append:/data/g8-kmsg-wifi.log
+
+[Install]
+WantedBy=multi-user.target

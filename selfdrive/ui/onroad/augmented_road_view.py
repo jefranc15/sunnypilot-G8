@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pyray as rl
 from cereal import log
@@ -58,8 +59,12 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
     self.driver_state_renderer = DriverStateRenderer()
 
   def _render(self, rect):
-    # Only render when system is started to avoid invalid data access
+    # G8_CAMERA_UI_BIG_TEST: during the controlled offroad camera test render
+    # only CameraView. Avoid model/HUD/calibration access until the G8 has a
+    # proper DeviceCameraConfig and normal onroad state.
     if not ui_state.started:
+      if os.path.exists("/data/G8_CAMERA_UI_TEST"):
+        CameraView._render(self, rect)
       return
 
     self._switch_stream_if_needed(ui_state.sm)
@@ -68,11 +73,16 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
     self._update_calibration()
 
     # Create inner content area with border padding
+    # LG G8: use the full display rect. The stock comma onroad view deliberately
+    # reserves UI_BORDER_SIZE on every edge, which appears as a black bar/border
+    # on the phone display. Keep stock behavior on real comma hardware.
+    g8_fullbleed = os.path.isdir("/opt/lg-android/vendor")
+    border = 0 if g8_fullbleed else UI_BORDER_SIZE
     self._content_rect = rl.Rectangle(
-      rect.x + UI_BORDER_SIZE,
-      rect.y + UI_BORDER_SIZE,
-      rect.width - 2 * UI_BORDER_SIZE,
-      rect.height - 2 * UI_BORDER_SIZE,
+      rect.x + border,
+      rect.y + border,
+      rect.width - 2 * border,
+      rect.height - 2 * border,
     )
 
     # Enable scissor mode to clip all rendering within content rectangle boundaries
@@ -112,6 +122,10 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
     pass
 
   def _draw_border(self, rect: rl.Rectangle):
+    # LG G8 full-bleed onroad camera: no comma-style 30 px black frame.
+    if os.path.isdir("/opt/lg-android/vendor"):
+      return
+
     rl.draw_rectangle_lines_ex(rect, UI_BORDER_SIZE, rl.BLACK)
     border_roundness = 0.12
     border_color = BORDER_COLORS.get(ui_state.status, BORDER_COLORS[UIStatus.DISENGAGED])
@@ -159,6 +173,11 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
       self.view_from_wide_calib = view_frame_from_device_frame @ wide_from_device @ device_from_calib
 
   def _calc_frame_matrix(self, rect: rl.Rectangle) -> np.ndarray:
+    # G8_CAMERA_UI_BIG_TEST: aspect-fit the raw LG road stream for the
+    # controlled offroad display test. Do not apply comma camera intrinsics.
+    if not ui_state.started and os.path.exists("/data/G8_CAMERA_UI_TEST"):
+      return CameraView._calc_frame_matrix(self, rect)
+
     # Check if we can use cached matrix
     cache_key = (
       ui_state.sm.recv_frame['liveCalibration'],
@@ -185,10 +204,21 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
     w, h = self._content_rect.width, self._content_rect.height
     cx, cy = intrinsic[0, 2], intrinsic[1, 2]
 
+    # LG G8 portrait-panel-in-landscape UI is wider than the comma camera viewport.
+    # Use cover scaling so the road image always fills the onroad content rect.
+    # This mirrors the newer sunnypilot AugmentedRoadView behavior.
+    is_g8 = os.path.isdir("/opt/lg-android/vendor")
+    if is_g8:
+      zoom = max(zoom, w / (2 * cx), h / (2 * cy))
+
     # Calculate max allowed offsets with margins
     margin = 5
-    max_x_offset = cx * zoom - w / 2 - margin
-    max_y_offset = cy * zoom - h / 2 - margin
+    if is_g8:
+      max_x_offset = max(0.0, cx * zoom - w / 2 - margin)
+      max_y_offset = max(0.0, cy * zoom - h / 2 - margin)
+    else:
+      max_x_offset = cx * zoom - w / 2 - margin
+      max_y_offset = cy * zoom - h / 2 - margin
 
     # Calculate and clamp offsets to prevent out-of-bounds issues
     try:

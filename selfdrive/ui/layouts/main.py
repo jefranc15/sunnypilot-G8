@@ -1,3 +1,4 @@
+import os
 import pyray as rl
 from enum import IntEnum
 import cereal.messaging as messaging
@@ -30,6 +31,7 @@ class MainLayout(Widget):
     self._sidebar = Sidebar()
     self._current_mode = MainState.HOME
     self._prev_onroad = False
+    self._g8_camera_ui_test_active = False
 
     # Initialize layouts
     self._home_layout = HomeLayout()
@@ -50,6 +52,27 @@ class MainLayout(Widget):
       gui_app.push_widget(self._onboarding_window)
 
   def _render(self, _):
+    # G8_CAMERA_UI_BIG_TEST: expose the already-created normal ONROAD camera
+    # layout while offroad, without opening a second GBM/EGL window.
+    g8_camera_ui_test = os.path.exists("/data/G8_CAMERA_UI_TEST")
+    if not ui_state.started and g8_camera_ui_test != self._g8_camera_ui_test_active:
+      self._g8_camera_ui_test_active = g8_camera_ui_test
+      if g8_camera_ui_test:
+        self._sidebar.set_visible(False)
+        self._set_current_layout(MainState.ONROAD)
+        try:
+          with open("/data/g8-ui-page-state", "w") as f:
+            f.write("ON\n")
+        except OSError:
+          pass
+      else:
+        self._set_mode_for_state()
+        try:
+          with open("/data/g8-ui-page-state", "w") as f:
+            f.write("OFF\n")
+        except OSError:
+          pass
+
     self._handle_onroad_transition()
     self._render_main_content()
 
@@ -80,6 +103,11 @@ class MainLayout(Widget):
       self._set_mode_for_state()
 
   def _set_mode_for_state(self):
+    if not ui_state.started and os.path.exists("/data/G8_CAMERA_UI_TEST"):
+      self._sidebar.set_visible(False)
+      self._set_current_layout(MainState.ONROAD)
+      return
+
     # Don't go onroad if body, home is onroad
     if ui_state.is_body:
       self._set_current_layout(MainState.HOME)

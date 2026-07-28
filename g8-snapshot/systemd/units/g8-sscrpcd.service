@@ -1,0 +1,21 @@
+[Unit]
+Description=LG G8 Qualcomm SSC sensorspd
+Requires=g8-sensor-stack.service
+After=g8-sensor-stack.service g8-lg-qrtr.service
+Before=g8-openpilot.service
+
+[Service]
+Type=simple
+Environment=ANDROID_ROOT=/system
+Environment=ANDROID_DATA=/data
+Environment=LD_PRELOAD=/data/local/tmp/libg8selinuxallow.so
+Environment=LD_LIBRARY_PATH=/apex/com.android.vndk.current/lib64:/vendor/lib64:/apex/com.android.runtime/lib64/bionic:/system/lib64
+ExecStart=/usr/sbin/chroot /tmp/g8-wifi-android /vendor/bin/sscrpcd sensorspd
+ExecStartPost=/data/g8-persistent/g8-wait-sns400.sh
+Restart=always
+RestartSec=2
+StandardOutput=append:/data/g8-sscrpcd.log
+StandardError=append:/data/g8-sscrpcd.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,4 @@
+import os
 import pyray as rl
 import cereal.messaging as messaging
 from openpilot.selfdrive.ui.mici.layouts.home import MiciHomeLayout
@@ -27,6 +28,7 @@ class MiciMainLayout(Scroller):
     self._prev_standstill = False
     self._onroad_time_delay: float | None = None
     self._setup = False
+    self._g8_camera_ui_test_active = False
 
     # Initialize widgets
     self._home_layout = MiciHomeLayout()
@@ -106,6 +108,19 @@ class MiciMainLayout(Scroller):
     if gui_app.widget_in_stack(self._onboarding_window):
       return
 
+    # Controlled LG G8 camera-display test. AugmentedRoadView already exists in
+    # this scroller, but normal offroad mode keeps the scroller on Home. Move to
+    # the existing camera page only when the flag changes; removing the flag
+    # returns immediately to Home.
+    g8_camera_ui_test = os.path.exists("/data/G8_CAMERA_UI_TEST")
+    if g8_camera_ui_test != self._g8_camera_ui_test_active:
+      self._g8_camera_ui_test_active = g8_camera_ui_test
+      print(f"G8_UI_CAMERA_PAGE={'ON' if g8_camera_ui_test else 'OFF'}", flush=True)
+      if g8_camera_ui_test:
+        gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._car_onroad_layout))
+      elif not ui_state.started:
+        gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._home_layout))
+
     if ui_state.started != self._prev_onroad:
       self._prev_onroad = ui_state.started
 
@@ -130,6 +145,9 @@ class MiciMainLayout(Scroller):
   def _on_interactive_timeout(self):
     # Don't pop if onboarding
     if gui_app.widget_in_stack(self._onboarding_window):
+      return
+
+    if os.path.exists("/data/G8_CAMERA_UI_TEST"):
       return
 
     if ui_state.started:

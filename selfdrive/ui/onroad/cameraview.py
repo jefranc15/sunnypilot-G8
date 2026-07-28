@@ -1,3 +1,4 @@
+import os
 import platform
 import numpy as np
 import pyray as rl
@@ -68,6 +69,11 @@ else:
 class CameraView(Widget):
   def __init__(self, name: str, stream_type: VisionStreamType):
     super().__init__()
+    # G8_OFFROAD_WIDE_UI_V1
+    # When explicitly requested, make the normal ROAD camera view subscribe
+    # to camerad's WIDE_ROAD stream. Driver-camera views are untouched.
+    if os.path.exists("/data/G8_CAMERA_UI_WIDE") and stream_type == VisionStreamType.VISION_STREAM_ROAD:
+      stream_type = VisionStreamType.VISION_STREAM_WIDE_ROAD
     self._name = name
     # Primary stream
     self.client = VisionIpcClient(name, stream_type, conflate=True)

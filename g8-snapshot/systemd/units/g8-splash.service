@@ -1,0 +1,11 @@
+[Unit]
+Description=AGNOS G8 startup splash
+After=g8-init.service
+Before=g8-openpilot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/comma/g8-splash.sh
+
+[Install]
+WantedBy=multi-user.target

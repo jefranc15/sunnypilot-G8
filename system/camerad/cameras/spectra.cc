@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "cdm.h"
 
 #include <algorithm>
@@ -191,9 +192,13 @@ void SpectraMaster::init() {
   assert(isp_fd >= 0);
   LOGD("opened isp %d", (int)isp_fd);
 
-  icp_fd = open_v4l_by_name_and_index("cam-icp");
-  assert(icp_fd >= 0);
-  LOGD("opened icp %d", (int)icp_fd);
+  if (getenv("G8_AGNOS") == nullptr) {
+    icp_fd = open_v4l_by_name_and_index("cam-icp");
+    assert(icp_fd >= 0);
+    LOGD("opened icp %d", (int)icp_fd);
+  } else {
+    LOGD("G8 R1: ICP/BPS is intentionally unused");
+  }
 
   // query ISP for MMU handles
   LOG("-- Query for MMU handles");
@@ -210,13 +215,15 @@ void SpectraMaster::init() {
   cdm_iommu = isp_query_cap_cmd.cdm_iommu.non_secure;
 
   // query ICP for MMU handles
-  struct cam_icp_query_cap_cmd icp_query_cap_cmd = {0};
-  query_cap_cmd.caps_handle = (uint64_t)&icp_query_cap_cmd;
-  query_cap_cmd.size = sizeof(icp_query_cap_cmd);
-  ret = do_cam_control(icp_fd, CAM_QUERY_CAP, &query_cap_cmd, sizeof(query_cap_cmd));
-  assert(ret == 0);
-  LOGD("using ICP MMU handle: %x", icp_query_cap_cmd.dev_iommu_handle.non_secure);
-  icp_device_iommu = icp_query_cap_cmd.dev_iommu_handle.non_secure;
+  if (getenv("G8_AGNOS") == nullptr) {
+    struct cam_icp_query_cap_cmd icp_query_cap_cmd = {0};
+    query_cap_cmd.caps_handle = (uint64_t)&icp_query_cap_cmd;
+    query_cap_cmd.size = sizeof(icp_query_cap_cmd);
+    ret = do_cam_control(icp_fd, CAM_QUERY_CAP, &query_cap_cmd, sizeof(query_cap_cmd));
+    assert(ret == 0);
+    LOGD("using ICP MMU handle: %x", icp_query_cap_cmd.dev_iommu_handle.non_secure);
+    icp_device_iommu = icp_query_cap_cmd.dev_iommu_handle.non_secure;
+  }
 
   // subscribe
   LOG("-- Subscribing");
@@ -292,33 +299,117 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
   configISP();
   if (cc.output_type == ISP_BPS_PROCESSED) configICP();
   configCSIPHY();
+
   linkDevices();
 
   LOGD("camera init %d", cc.camera_num);
   buf.init(this, v, ife_buf_depth, cc.stream_type);
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    fprintf(stderr, "G8_VIPC_BUF_INIT_DONE sensor=%d\n", cc.camera_num);
+    fflush(stderr);
+  }
+
   camera_map_bufs();
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    fprintf(stderr, "G8_CAMERA_MAP_BUFS_DONE sensor=%d\n", cc.camera_num);
+    fflush(stderr);
+  }
+
   clearAndRequeue(1);
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    const char *target =
+      getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ? "IMX520" :
+      (getenv("G8_CAMERA_TARGET_WIDE") != nullptr ? "IMX351" : "IMX363");
+
+    fprintf(stderr, "G8_QUEUE_READY sensor=%d depth=%d\n", cc.camera_num, ife_buf_depth);
+    fprintf(stderr,
+            "G8_IMX520_QUEUE_V1 CAMERA_OPEN_DONE sensor=%d target=%s sensor_started=%d size=%dx%d ife_phy=%u\n",
+            cc.camera_num, target,
+            sensor_started ? 1 : 0,
+            sensor->frame_width, sensor->frame_height, cc.phy);
+    fflush(stderr);
+  }
 }
 
 void SpectraCamera::sensors_start() {
   if (!enabled) return;
   LOGD("starting sensor %d", cc.camera_num);
-  sensors_i2c(sensor->start_reg_array.data(), sensor->start_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+
+  if (getenv("G8_AGNOS") != nullptr) {
+    // LG SM8150 native sensor state machine:
+    // preload stream-off, preload stream-on, then CAM_START_DEV applies stream-on.
+    sensors_i2c(sensor->stop_reg_array.data(), sensor->stop_reg_array.size(),
+                CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMOFF, sensor->data_word);
+    if (!enabled) return;
+
+    sensors_i2c(sensor->start_reg_array.data(), sensor->start_reg_array.size(),
+                CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMON, sensor->data_word);
+    if (!enabled) return;
+
+    int ret = device_control(sensor_fd, CAM_START_DEV, session_handle, sensor_dev_handle);
+    if (getenv("G8_CAMERA_FIRST_SOF") != nullptr) {
+      fprintf(stderr, "G8_SENSOR_START_RET=%d\n", ret);
+      fflush(stderr);
+    }
+    if (ret != 0) {
+      enabled = false;
+      return;
+    }
+
+    sensor_started = true;
+    return;
+  }
+
+  sensors_i2c(sensor->start_reg_array.data(), sensor->start_reg_array.size(),
+              CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+}
+
+void SpectraCamera::sensors_stop() {
+  if (getenv("G8_AGNOS") == nullptr || !sensor_started) return;
+
+  int ret = device_control(sensor_fd, CAM_STOP_DEV, session_handle, sensor_dev_handle);
+  if (getenv("G8_CAMERA_FIRST_SOF") != nullptr) {
+    fprintf(stderr, "G8_SENSOR_STOP_RET=%d\n", ret);
+    fflush(stderr);
+  }
+  if (ret == 0) sensor_started = false;
 }
 
 void SpectraCamera::sensors_poke(int request_id) {
   uint32_t cam_packet_handle = 0;
-  int size = sizeof(struct cam_packet);
-  auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
+
+  // LG SM8150 cam_sensor_i2c_pkt_parse() rejects a backing buffer whose
+  // total length is exactly sizeof(cam_packet) when config.offset == 0:
+  //   offset >= len_of_buff - sizeof(cam_packet)
+  // is true for 0 >= 0. Keep the logical packet size unchanged, but give
+  // the kernel one aligned word of backing padding.
+  const int packet_size = sizeof(struct cam_packet);
+  const int alloc_size = packet_size + sizeof(uint32_t);
+  auto pkt = m->mem_mgr.alloc<struct cam_packet>(alloc_size, &cam_packet_handle);
+
   pkt->num_cmd_buf = 0;
   pkt->kmd_cmd_buf_index = -1;
-  pkt->header.size = size;
+  pkt->header.size = packet_size;
   pkt->header.op_code = CAM_SENSOR_PACKET_OPCODE_SENSOR_NOP;
   pkt->header.request_id = request_id;
 
   int ret = device_config(sensor_fd, session_handle, sensor_dev_handle, cam_packet_handle);
+
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    fprintf(stderr, "G8_SENSOR_NOP_RET req=%d ret=%d packet=%d alloc=%d\n",
+            request_id, ret, packet_size, alloc_size);
+    fflush(stderr);
+  }
+
   if (ret != 0) {
     LOGE("** sensor %d FAILED poke, disabling", cc.camera_num);
+
+    // Diagnostic queue-only runs must still execute the full unlink/stop/
+    // release path even if the NOP experiment fails.
+    if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+      return;
+    }
+
     enabled = false;
     return;
   }
@@ -347,6 +438,19 @@ void SpectraCamera::sensors_i2c(const struct i2c_random_wr_payload* dat, int len
   memcpy(i2c_random_wr->random_wr_payload, dat, len*sizeof(struct i2c_random_wr_payload));
 
   int ret = device_config(sensor_fd, session_handle, sensor_dev_handle, cam_packet_handle);
+  if (getenv("G8_CAMERA_CONFIG_ONLY") != nullptr) {
+    fprintf(stderr, "G8_SENSOR_CONFIG_RET=%d\n", ret);
+    fflush(stderr);
+  }
+  if (getenv("G8_CAMERA_FIRST_SOF") != nullptr) {
+    if (op_code == CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMON) {
+      fprintf(stderr, "G8_STREAMON_PRELOAD_RET=%d\n", ret);
+      fflush(stderr);
+    } else if (op_code == CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMOFF) {
+      fprintf(stderr, "G8_STREAMOFF_PRELOAD_RET=%d\n", ret);
+      fflush(stderr);
+    }
+  }
   if (ret != 0) {
     LOGE("** sensor %d FAILED i2c, disabling", cc.camera_num);
     enabled = false;
@@ -355,6 +459,25 @@ void SpectraCamera::sensors_i2c(const struct i2c_random_wr_payload* dat, int len
 }
 
 int SpectraCamera::sensors_init() {
+  const bool g8_camera = getenv("G8_AGNOS") != nullptr;
+  const bool g8_wide = g8_camera && getenv("G8_CAMERA_TARGET_WIDE") != nullptr;
+  const bool g8_driver = g8_camera && getenv("G8_CAMERA_TARGET_DRIVER") != nullptr;
+  // G8_DUAL_ROAD_DRIVER_V2:
+  // - normal logical DRIVER is physical IMX520 slot 1
+  // - explicit Stage-7 TARGET_DRIVER harness remains supported
+  // This same boolean intentionally selects the IMX520 probe slot, 512-byte
+  // power packet, and exact LG IMX520 power sequence below.
+  const bool g8_driver_stream =
+      g8_camera &&
+      cc.stream_type == VISION_STREAM_DRIVER;
+  const int g8_sensor_slot = g8_driver_stream ? 1 : cc.camera_num;
+
+  if (g8_wide && g8_driver) {
+    fprintf(stderr, "G8_CAMERA_TARGET_CONFLICT wide=1 driver=1\n");
+    fflush(stderr);
+    return -1;
+  }
+
   uint32_t cam_packet_handle = 0;
   int size = sizeof(struct cam_packet)+sizeof(struct cam_cmd_buf_desc)*2;
   auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
@@ -369,82 +492,295 @@ int SpectraCamera::sensors_init() {
   auto i2c_info = m->mem_mgr.alloc<struct cam_cmd_i2c_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);
   auto probe = (struct cam_cmd_probe *)(i2c_info.get() + 1);
 
-  probe->camera_id = cc.camera_num;
-  i2c_info->slave_addr = sensor->getSlaveAddress(cc.camera_num);
-  // 0(I2C_STANDARD_MODE) = 100khz, 1(I2C_FAST_MODE) = 400khz
-  //i2c_info->i2c_freq_mode = I2C_STANDARD_MODE;
-  i2c_info->i2c_freq_mode = I2C_FAST_MODE;
+  probe->camera_id = g8_sensor_slot;
+  i2c_info->slave_addr = sensor->getSlaveAddress(g8_sensor_slot);
+  // LG CamX asks FAST_PLUS (1 MHz). Stock comma remains FAST (400 kHz).
+  i2c_info->i2c_freq_mode = g8_camera ? 3 : I2C_FAST_MODE;
   i2c_info->cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
 
   probe->data_type = CAMERA_SENSOR_I2C_TYPE_WORD;
   probe->addr_type = CAMERA_SENSOR_I2C_TYPE_WORD;
-  probe->op_code = 3;   // don't care?
+  probe->op_code = 3;
   probe->cmd_type = CAMERA_SENSOR_CMD_TYPE_PROBE;
   probe->reg_addr = sensor->probe_reg_addr;
   probe->expected_data = sensor->probe_expected_data;
   probe->data_mask = 0;
 
-  //buf_desc[1].size = buf_desc[1].length = 148;
-  buf_desc[1].size = buf_desc[1].length = 196;
+  // IMX363/stock use the existing exact 196-byte packet. IMX351 has more
+  // power commands, so give its backing buffer headroom and later set the
+  // descriptor to the exact used length.
+  const uint32_t power_alloc_size = (g8_wide || g8_driver || g8_driver_stream) ? 512 : 196;
+  buf_desc[1].size = buf_desc[1].length = power_alloc_size;
   buf_desc[1].type = CAM_CMD_BUF_I2C;
   auto power_settings = m->mem_mgr.alloc<struct cam_cmd_power>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
-
-  // power on
   struct cam_cmd_power *power = power_settings.get();
-  power->count = 4;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
-  power->power_settings[0].power_seq_type = 3; // clock??
-  power->power_settings[1].power_seq_type = 1; // analog
-  power->power_settings[2].power_seq_type = 2; // digital
-  power->power_settings[3].power_seq_type = 8; // reset low
-  power = power_set_wait(power, 1);
 
-  // set clock
-  power->count = 1;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
-  power->power_settings[0].power_seq_type = 0;
-  power->power_settings[0].config_val_low = sensor->mclk_frequency;
-  power = power_set_wait(power, 1);
+  if (g8_wide) {
+    // Exact LG IMX351 CamX power-up:
+    // CUSTOM_REG1=1 (1ms)
+    // CUSTOM_GPIO1=0, CUSTOM_GPIO2=0, VANA=0, VDIG=0, VIO=0 (1ms)
+    // STANDBY=1 (1ms), MCLK=19.2MHz (1ms), RESET=1 (1ms).
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 6;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
 
-  // reset high
-  power->count = 1;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
-  power->power_settings[0].power_seq_type = 8;
-  power->power_settings[0].config_val_low = 1;
-  // wait 650000 cycles @ 19.2 mhz = 33.8 ms
-  power = power_set_wait(power, 34);
+    power->count = 5;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 10;
+    power->power_settings[0].config_val_low = 0;
+    power->power_settings[1].power_seq_type = 11;
+    power->power_settings[1].config_val_low = 0;
+    power->power_settings[2].power_seq_type = 1;
+    power->power_settings[2].config_val_low = 0;
+    power->power_settings[3].power_seq_type = 2;
+    power->power_settings[3].config_val_low = 0;
+    power->power_settings[4].power_seq_type = 3;
+    power->power_settings[4].config_val_low = 0;
+    power = power_set_wait(power, 1);
 
-  // probe happens here
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 9;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
 
-  // disable clock
-  power->count = 1;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
-  power->power_settings[0].power_seq_type = 0;
-  power->power_settings[0].config_val_low = 0;
-  power = power_set_wait(power, 1);
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = sensor->mclk_frequency;
+    power = power_set_wait(power, 1);
 
-  // reset high
-  power->count = 1;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
-  power->power_settings[0].power_seq_type = 8;
-  power->power_settings[0].config_val_low = 1;
-  power = power_set_wait(power, 1);
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
 
-  // reset low
-  power->count = 1;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
-  power->power_settings[0].power_seq_type = 8;
-  power->power_settings[0].config_val_low = 0;
-  power = power_set_wait(power, 1);
+    // Probe happens here.
 
-  // power off
-  power->count = 3;
-  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
-  power->power_settings[0].power_seq_type = 2;
-  power->power_settings[1].power_seq_type = 1;
-  power->power_settings[2].power_seq_type = 3;
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 9;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 6;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 3;
+    power->power_settings[1].power_seq_type = 2;
+    power->power_settings[2].power_seq_type = 1;
+    power->power_settings[3].power_seq_type = 11;
+    power->power_settings[4].power_seq_type = 10;
+    power->power_settings[5].power_seq_type = 6;
+
+    char *power_end = (char *)power + sizeof(struct cam_cmd_power) +
+                      (power->count - 1) * sizeof(struct cam_power_settings);
+    const uint32_t used = (uint32_t)(power_end - (char *)power_settings.get());
+    if (used > power_alloc_size) {
+      fprintf(stderr, "G8_IMX351_POWER_OVERFLOW used=%u alloc=%u\n", used, power_alloc_size);
+      fflush(stderr);
+      return -1;
+    }
+    buf_desc[1].size = buf_desc[1].length = used;
+    fprintf(stderr, "G8_IMX351_POWER_BYTES=%u\n", used);
+    fflush(stderr);
+
+  } else if (g8_driver_stream || g8_driver) {
+    // G8_IMX520_PROBE_V1
+    // Exact LG CamX IMX520 power-up:
+    // STANDBY=0; CUSTOM_GPIO1=1; VIO/VANA/VDIG=1 (1ms after VDIG);
+    // RESET=1 (1ms); MCLK=19.2MHz (2ms); CUSTOM_GPIO2=1 (1ms).
+    //
+    // Exact power-down:
+    // MCLK=0; RESET=0; VDIG/VANA/VIO=0; CUSTOM_GPIO2=0;
+    // CUSTOM_GPIO1=0; STANDBY=1.
+
+    power->count = 5;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 9;
+    power->power_settings[0].config_val_low = 0;
+    power->power_settings[1].power_seq_type = 10;
+    power->power_settings[1].config_val_low = 1;
+    power->power_settings[2].power_seq_type = 3;
+    power->power_settings[2].config_val_low = 1;
+    power->power_settings[3].power_seq_type = 1;
+    power->power_settings[3].config_val_low = 1;
+    power->power_settings[4].power_seq_type = 2;
+    power->power_settings[4].config_val_low = 1;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = sensor->mclk_frequency;
+    power = power_set_wait(power, 2);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 11;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
+
+    // Probe happens here.
+
+    power->count = 8;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = 0;
+    power->power_settings[1].power_seq_type = 8;
+    power->power_settings[1].config_val_low = 0;
+    power->power_settings[2].power_seq_type = 2;
+    power->power_settings[2].config_val_low = 0;
+    power->power_settings[3].power_seq_type = 1;
+    power->power_settings[3].config_val_low = 0;
+    power->power_settings[4].power_seq_type = 3;
+    power->power_settings[4].config_val_low = 0;
+    power->power_settings[5].power_seq_type = 11;
+    power->power_settings[5].config_val_low = 0;
+    power->power_settings[6].power_seq_type = 10;
+    power->power_settings[6].config_val_low = 0;
+    power->power_settings[7].power_seq_type = 9;
+    power->power_settings[7].config_val_low = 1;
+
+    char *power_end = (char *)power + sizeof(struct cam_cmd_power) +
+                      (power->count - 1) * sizeof(struct cam_power_settings);
+    const uint32_t used = (uint32_t)(power_end - (char *)power_settings.get());
+    if (used > power_alloc_size) {
+      fprintf(stderr, "G8_IMX520_POWER_OVERFLOW used=%u alloc=%u\n", used, power_alloc_size);
+      fflush(stderr);
+      return -1;
+    }
+    buf_desc[1].size = buf_desc[1].length = used;
+    fprintf(stderr, "G8_IMX520_POWER_BYTES=%u\n", used);
+    fflush(stderr);
+
+  } else if (g8_camera) {
+    // LG SM8150 enum:
+    // MCLK=0 VANA=1 VDIG=2 VIO=3 CUSTOM_REG1=6 RESET=8.
+    //
+    // Exact IMX363 CamX power-up:
+    // CUSTOM_REG1=1 (1ms), VANA/VDIG/VIO (1ms after VIO),
+    // RESET=1 (3ms), MCLK=19.2MHz (1ms).
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 6;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
+
+    power->count = 3;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 1;
+    power->power_settings[1].power_seq_type = 2;
+    power->power_settings[2].power_seq_type = 3;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 3);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = sensor->mclk_frequency;
+    power = power_set_wait(power, 1);
+
+    // Probe happens here.
+
+    // Exact LG power-down: MCLK (1ms), RESET=0 (1ms),
+    // VIO, VDIG, VANA, CUSTOM_REG1.
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 4;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 3;
+    power->power_settings[1].power_seq_type = 2;
+    power->power_settings[2].power_seq_type = 1;
+    power->power_settings[3].power_seq_type = 6;
+  } else {
+    // Original comma sensor power sequence.
+    power->count = 4;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 3;
+    power->power_settings[1].power_seq_type = 1;
+    power->power_settings[2].power_seq_type = 2;
+    power->power_settings[3].power_seq_type = 8;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = sensor->mclk_frequency;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 34);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 0;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 8;
+    power->power_settings[0].config_val_low = 0;
+    power = power_set_wait(power, 1);
+
+    power->count = 3;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 2;
+    power->power_settings[1].power_seq_type = 1;
+    power->power_settings[2].power_seq_type = 3;
+  }
 
   int ret = do_cam_control(sensor_fd, CAM_SENSOR_PROBE_CMD, (void *)(uintptr_t)cam_packet_handle, 0);
+  if (getenv("G8_AGNOS") != nullptr) {
+    fprintf(stderr, "G8_SENSOR_PROBE_RET=%d\n", ret);
+    fflush(stderr);
+  }
   LOGD("probing the sensor: %d", ret);
   return ret;
 }
@@ -704,40 +1040,56 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   }
 
   // *** patches ***
+  // sets up kernel address translation for optional IFE LUTs
   {
-    assert(patches.size() == 0 || patches.size() == 4);
-    pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
+    const bool has_linearization =
+        !sensor->linearization_pts.empty() &&
+        !sensor->linearization_lut.empty();
 
-    if (patches.size() > 0) {
-      // linearization LUT
-      add_patch(pkt.get(), bps_cdm_program_array.handle, patches[0], bps_linearization_lut.handle, 0);
-      // gamma LUTs
-      for (int i = 0; i < 3; i++) {
-        add_patch(pkt.get(), bps_cdm_program_array.handle, patches[i+1], bps_gamma_lut.handle, 0);
+    const bool has_vignetting =
+        cc.vignetting_correction &&
+        !sensor->vignetting_lut.empty();
+
+    const size_t expected_patches =
+        (has_linearization ? 1U : 0U) +
+        (has_vignetting ? 2U : 0U) +
+        3U;
+
+    assert(patches.size() == expected_patches || patches.empty());
+
+    pkt->patch_offset =
+        sizeof(struct cam_cmd_buf_desc) * pkt->num_cmd_buf +
+        sizeof(struct cam_buf_io_cfg) * pkt->num_io_configs;
+
+    if (!patches.empty()) {
+      size_t patch_idx = 0;
+
+      if (has_linearization) {
+        add_patch(pkt.get(), ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_linearization_lut.handle, 0);
       }
+
+      if (has_vignetting) {
+        add_patch(pkt.get(), ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_vignetting_lut.handle, 0);
+
+        add_patch(pkt.get(), ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_vignetting_lut.handle,
+                  ife_vignetting_lut.size);
+      }
+
+      for (int i = 0; i < 3; i++) {
+        add_patch(pkt.get(), ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_gamma_lut.handle,
+                  ife_gamma_lut.size * i);
+      }
+
+      assert(patch_idx == patches.size());
     }
-
-    // input frame
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[0].ptr[0]), buf_handle_raw[idx], 0);
-
-    if (needs_downscale) {
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[1].ptr[0]), bps_fullres_dummy.handle, 0);
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[1].ptr[1]), bps_fullres_dummy.handle, io_cfg[2].offsets[1]);
-      // output frame at REG1
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[7].ptr[0]), buf_handle_yuv[idx], 0);
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[7].ptr[1]), buf_handle_yuv[idx], io_cfg[1].offsets[1]);
-    } else {
-      // output frame at FULL
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[1].ptr[0]), buf_handle_yuv[idx], 0);
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, frames[1].ptr[1]), buf_handle_yuv[idx], io_cfg[1].offsets[1]);
-    }
-
-    // rest of buffers
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, settings_addr), bps_iq.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, cdm_addr2), bps_cmd.handle, sizeof(bps_tmp));
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + 0xc8, bps_cdm_program_array.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, striping_addr), bps_striping.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, cdm_addr), bps_cdm_striping_bl.handle, 0);
   }
 
   int ret = device_config(m->icp_fd, session_handle, icp_dev_handle, cam_packet_handle);
@@ -917,27 +1269,63 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   }
 
   // *** patches ***
-  // sets up the kernel driver to do address translation for the IFE
+  // IFE DMI patches are optional for sensors without linearization/vignetting LUTs.
   {
-    // order here corresponds to the one in build_initial_config
-    assert(patches.size() == 6 || patches.size() == 0);
+    const bool has_linearization =
+        !sensor->linearization_pts.empty() &&
+        !sensor->linearization_lut.empty();
 
-    pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
-    if (patches.size() > 0) {
-      // linearization LUT
-      add_patch(pkt.get(), ife_cmd.handle, patches[0], ife_linearization_lut.handle, 0);
+    const bool has_vignetting =
+        cc.vignetting_correction &&
+        !sensor->vignetting_lut.empty();
 
-      // vignetting correction LUTs
-      add_patch(pkt.get(), ife_cmd.handle, patches[1], ife_vignetting_lut.handle, 0);
-      add_patch(pkt.get(), ife_cmd.handle, patches[2], ife_vignetting_lut.handle, ife_vignetting_lut.size);
+    const size_t expected_patches =
+        (has_linearization ? 1U : 0U) +
+        (has_vignetting ? 2U : 0U) +
+        3U;  // RGB gamma
 
-      // gamma LUTs
-      for (int i = 0; i < 3; i++) {
-        add_patch(pkt.get(), ife_cmd.handle, patches[i+3], ife_gamma_lut.handle, ife_gamma_lut.size*i);
+    assert(patches.size() == expected_patches || patches.empty());
+
+    pkt->patch_offset =
+        sizeof(struct cam_cmd_buf_desc) * pkt->num_cmd_buf +
+        sizeof(struct cam_buf_io_cfg) * pkt->num_io_configs;
+
+    if (!patches.empty()) {
+      size_t patch_idx = 0;
+
+      if (has_linearization) {
+        add_patch(pkt.get(),
+                  ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_linearization_lut.handle,
+                  0);
       }
+
+      if (has_vignetting) {
+        add_patch(pkt.get(),
+                  ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_vignetting_lut.handle,
+                  0);
+
+        add_patch(pkt.get(),
+                  ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_vignetting_lut.handle,
+                  ife_vignetting_lut.size);
+      }
+
+      for (int i = 0; i < 3; i++) {
+        add_patch(pkt.get(),
+                  ife_cmd.handle,
+                  patches[patch_idx++],
+                  ife_gamma_lut.handle,
+                  ife_gamma_lut.size * i);
+      }
+
+      assert(patch_idx == patches.size());
     }
   }
-
   int ret = device_config(m->isp_fd, session_handle, isp_dev_handle, cam_packet_handle);
   assert(ret == 0);
 }
@@ -1034,8 +1422,19 @@ void SpectraCamera::camera_map_bufs() {
 }
 
 bool SpectraCamera::openSensor() {
-  sensor_fd = open_v4l_by_name_and_index("cam-sensor-driver", cc.camera_num);
+  // G8_DUAL_ROAD_DRIVER_V2: normal logical DRIVER maps to physical slot 1.
+  const bool g8_driver_stream =
+      getenv("G8_AGNOS") != nullptr &&
+      cc.stream_type == VISION_STREAM_DRIVER;
+  const int physical_sensor_index = g8_driver_stream ? 1 : cc.camera_num;
+  sensor_fd = open_v4l_by_name_and_index("cam-sensor-driver", physical_sensor_index);
   assert(sensor_fd >= 0);
+  if (g8_driver_stream) {
+    fprintf(stderr,
+            "G8_IMX520_DRIVER_STREAM_V1 SENSOR_MAP logical_camera=%d physical_sensor=%d phy=%u\n",
+            cc.camera_num, physical_sensor_index, cc.phy);
+    fflush(stderr);
+  }
   LOGD("opened sensor for %d", cc.camera_num);
 
   LOGD("-- Probing sensor %d", cc.camera_num);
@@ -1046,19 +1445,119 @@ bool SpectraCamera::openSensor() {
   };
 
   // Figure out which sensor we have
-  if (!init_sensor_lambda(new OS04C10) &&
-      !init_sensor_lambda(new OX03C10)) {
+  if (getenv("G8_AGNOS") != nullptr) {
+    const bool g8_wide = getenv("G8_CAMERA_TARGET_WIDE") != nullptr;
+    const bool g8_driver = getenv("G8_CAMERA_TARGET_DRIVER") != nullptr;
+
+    if (g8_wide && g8_driver) {
+      fprintf(stderr, "G8_CAMERA_TARGET_CONFLICT wide=1 driver=1\n");
+      fflush(stderr);
+      enabled = false;
+      return false;
+    }
+
+    if (g8_driver_stream || g8_driver) {
+      fprintf(stderr, "G8_IMX520_PROBE_V1 selecting IMX520 slot=%d\n", cc.camera_num);
+      fflush(stderr);
+      if (!init_sensor_lambda(new IMX520G8)) {
+        LOGE("** G8 IMX520 sensor %d FAILED bringup, disabling", cc.camera_num);
+        enabled = false;
+        return false;
+      }
+    } else if (g8_wide) {
+      fprintf(stderr, "G8_IMX351_PROBE_PATCH selecting IMX351 slot=%d\n", cc.camera_num);
+      fflush(stderr);
+      if (!init_sensor_lambda(new IMX351G8)) {
+        LOGE("** G8 IMX351 sensor %d FAILED bringup, disabling", cc.camera_num);
+        enabled = false;
+        return false;
+      }
+    } else if (!init_sensor_lambda(new IMX363G8)) {
+      LOGE("** G8 IMX363 sensor %d FAILED bringup, disabling", cc.camera_num);
+      enabled = false;
+      return false;
+    }
+  } else if (!init_sensor_lambda(new OS04C10) &&
+             !init_sensor_lambda(new OX03C10)) {
     LOGE("** sensor %d FAILED bringup, disabling", cc.camera_num);
     enabled = false;
     return false;
   }
   LOGD("-- Probing sensor %d success", cc.camera_num);
 
+  if (getenv("G8_CAMERA_PROBE_ONLY") != nullptr) {
+    const char *target =
+      getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ? "IMX520" :
+      (getenv("G8_CAMERA_TARGET_WIDE") != nullptr ? "IMX351" : "IMX363");
+    fprintf(stderr, "G8_PROBE_ONLY_SUCCESS sensor=%d target=%s\n", cc.camera_num, target);
+    fflush(stderr);
+    enabled = false;
+    return false;
+  }
+
   // create session
   struct cam_req_mgr_session_info session_info = {};
   int ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_CREATE_SESSION, &session_info, sizeof(session_info));
   LOGD("get session: %d 0x%X", ret, session_info.session_hdl);
   session_handle = session_info.session_hdl;
+
+  // G8_MAIN_FOCUS_ACQUIRE_V1
+  // Safely prove that MAIN actuator slot 0 (/dev/v4l-subdev6)
+  // can be acquired using the same request-manager session as IMX363.
+  // No actuator CONFIG or I2C commands are sent here.
+  if (getenv("G8_MAIN_FOCUS_ACQUIRE_TEST") != nullptr &&
+      getenv("G8_AGNOS") != nullptr &&
+      cc.camera_num == 0 &&
+      getenv("G8_CAMERA_TARGET_WIDE") == nullptr &&
+      getenv("G8_CAMERA_TARGET_DRIVER") == nullptr) {
+
+    const char *g8_act_path = "/dev/v4l-subdev6";
+    int g8_act_fd = open_v4l_by_name_and_index("cam-actuator-driver", 0);
+
+    fprintf(stderr,
+            "G8_MAIN_FOCUS_ACQUIRE_V1 OPEN path=%s fd=%d session=0x%X\n",
+            g8_act_path, g8_act_fd, session_handle);
+    fflush(stderr);
+
+    if (g8_act_fd >= 0) {
+      auto g8_act_handle =
+          device_acquire(g8_act_fd, session_handle, nullptr);
+
+      if (g8_act_handle) {
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_ACQUIRE_V1 ACQUIRE_OK handle=0x%X\n",
+                *g8_act_handle);
+        fflush(stderr);
+
+        int g8_act_release_ret =
+            device_control(g8_act_fd, CAM_RELEASE_DEV,
+                           session_handle, *g8_act_handle);
+
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_ACQUIRE_V1 RELEASE ret=%d\n",
+                g8_act_release_ret);
+        fflush(stderr);
+      } else {
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_ACQUIRE_V1 ACQUIRE_FAIL\n");
+        fflush(stderr);
+      }
+
+      close(g8_act_fd);
+    }
+  }
+
+  // G8_MAIN_FOCUS_INIT_V1
+  //
+  // MAIN IMX363 actuator:
+  //   slot 0 -> /dev/v4l-subdev6
+  //   LG actuator = lc898219xi
+  //
+  // Stage AF-2:
+  //   acquire actuator
+  //   configure LG slave 0xE4 using CCI FAST_PLUS
+  //   write init register 0xE0 = 0x01
+  //   DO NOT write focus DAC register 0x84 yet.
 
   // access the sensor
   LOGD("-- Accessing sensor");
@@ -1068,18 +1567,451 @@ bool SpectraCamera::openSensor() {
   LOGD("acquire sensor dev");
 
   LOG("-- Configuring sensor");
+  if (getenv("G8_CAMERA_CONFIG_ONLY") != nullptr) {
+    const char *target =
+      getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ? "IMX520" :
+      (getenv("G8_CAMERA_TARGET_WIDE") != nullptr ? "IMX351" : "IMX363");
+    fprintf(stderr,
+            "G8_IMX520_CONFIG_V1 BEGIN sensor=%d target=%s writes=%zu size=%ux%u\n",
+            cc.camera_num, target, sensor->init_reg_array.size(),
+            sensor->frame_width, sensor->frame_height);
+    fflush(stderr);
+  }
+
   sensors_i2c(sensor->init_reg_array.data(), sensor->init_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+
+  // G8_MAIN_FOCUS_AFTER_SENSOR_POWER_V1
+  if (getenv("G8_AGNOS") != nullptr &&
+      cc.camera_num == 0 &&
+      getenv("G8_CAMERA_TARGET_WIDE") == nullptr &&
+      getenv("G8_CAMERA_TARGET_DRIVER") == nullptr) {
+
+    const char *g8_act_path = "/dev/v4l-subdev6";
+    int g8_act_fd = open_v4l_by_name_and_index("cam-actuator-driver", 0);
+
+    fprintf(stderr,
+            "G8_MAIN_FOCUS_INIT_V1 OPEN path=%s fd=%d session=0x%X\n",
+            g8_act_path, g8_act_fd, session_handle);
+    fflush(stderr);
+
+    if (g8_act_fd >= 0) {
+      auto g8_act_handle =
+          device_acquire(g8_act_fd, session_handle, nullptr);
+
+      if (!g8_act_handle) {
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_INIT_V1 ACQUIRE_FAIL\n");
+        fflush(stderr);
+      } else {
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_INIT_V1 ACQUIRE_OK handle=0x%X\n",
+                *g8_act_handle);
+        fflush(stderr);
+
+        // Qualcomm actuator packet opcodes:
+        // INIT=0, AUTO_MOVE=1, MANUAL_MOVE=2.
+        constexpr uint32_t G8_ACTUATOR_OPCODE_INIT = 0;
+
+        uint32_t g8_act_packet_handle = 0;
+
+        const int g8_act_packet_size =
+            sizeof(struct cam_packet) +
+            2 * sizeof(struct cam_cmd_buf_desc);
+
+        auto g8_act_pkt =
+            m->mem_mgr.alloc<struct cam_packet>(
+                g8_act_packet_size,
+                &g8_act_packet_handle);
+
+        g8_act_pkt->header.op_code = G8_ACTUATOR_OPCODE_INIT;
+        g8_act_pkt->header.size = g8_act_packet_size;
+        g8_act_pkt->header.request_id = 0;
+        g8_act_pkt->header.flags = 0;
+        g8_act_pkt->header.padding = 0;
+
+        g8_act_pkt->cmd_buf_offset = 0;
+        g8_act_pkt->num_cmd_buf = 2;
+        g8_act_pkt->io_configs_offset = 0;
+        g8_act_pkt->num_io_configs = 0;
+        g8_act_pkt->patch_offset = 0;
+        g8_act_pkt->num_patches = 0;
+        g8_act_pkt->kmd_cmd_buf_index = -1;
+        g8_act_pkt->kmd_cmd_buf_offset = 0;
+
+        auto *g8_desc =
+            reinterpret_cast<struct cam_cmd_buf_desc *>(
+                &g8_act_pkt->payload);
+
+        // Command buffer 0: actuator slave/I2C information.
+        g8_desc[0].offset = 0;
+        g8_desc[0].size =
+            g8_desc[0].length =
+                sizeof(struct cam_cmd_i2c_info);
+        g8_desc[0].type = CAM_CMD_BUF_I2C;
+        g8_desc[0].meta_data = 0;
+
+        auto g8_i2c_info =
+            m->mem_mgr.alloc<struct cam_cmd_i2c_info>(
+                g8_desc[0].size,
+                reinterpret_cast<uint32_t *>(&g8_desc[0].mem_handle));
+
+        g8_i2c_info->slave_addr = 0xE4;
+        g8_i2c_info->i2c_freq_mode = 3;  // I2C_FAST_PLUS_MODE
+        g8_i2c_info->cmd_type =
+            CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
+
+        // Command buffer 1: LG LC898219XI initialization.
+        // No focus-position/DAC write occurs here.
+        g8_desc[1].offset = 0;
+        g8_desc[1].size =
+            g8_desc[1].length =
+                sizeof(struct i2c_rdwr_header) +
+                sizeof(struct i2c_random_wr_payload);
+        g8_desc[1].type = CAM_CMD_BUF_I2C;
+        g8_desc[1].meta_data = 0;
+
+        auto g8_init =
+            m->mem_mgr.alloc<struct cam_cmd_i2c_random_wr>(
+                g8_desc[1].size,
+                reinterpret_cast<uint32_t *>(&g8_desc[1].mem_handle));
+
+        g8_init->header.count = 1;
+        g8_init->header.op_code = 1;
+        g8_init->header.cmd_type =
+            CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+        g8_init->header.data_type =
+            CAMERA_SENSOR_I2C_TYPE_BYTE;
+        g8_init->header.addr_type =
+            CAMERA_SENSOR_I2C_TYPE_BYTE;
+
+        g8_init->random_wr_payload[0].reg_addr = 0xE0;
+        g8_init->random_wr_payload[0].reg_data = 0x01;
+
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_INIT_V1 CONFIG "
+                "slave=0xE4 freq=3 reg=0xE0 val=0x01 "
+                "packet_handle=0x%X\n",
+                g8_act_packet_handle);
+        fflush(stderr);
+
+        errno = 0;
+        int g8_act_cfg_ret =
+            device_config(g8_act_fd,
+                          session_handle,
+                          *g8_act_handle,
+                          g8_act_packet_handle);
+        int g8_act_cfg_errno = errno;
+
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_INIT_V2 CONFIG_RET=%d ERRNO=%d\n",
+                g8_act_cfg_ret, g8_act_cfg_errno);
+        fflush(stderr);
+        // G8_MAIN_FOCUS_WAKE_8C_V1
+        // LC898219XI reference wake sequence: after 0xE0=0x01,
+        // allow wake time, then write 0x8C=0xE9. No DAC write yet.
+        if (g8_act_cfg_ret == 0) {
+          usleep(20000);
+
+          // G8_MAIN_FOCUS_ID_F0_V1
+          // Exact-byte identity/communication poll: LC898219XI register 0xF0 == 0xA5.
+          constexpr uint8_t G8_WAIT_OP_COND = 1;
+
+          const auto g8_write_mem_handle = g8_desc[1].mem_handle;
+          const auto g8_write_offset = g8_desc[1].offset;
+          const auto g8_write_size = g8_desc[1].size;
+          const auto g8_write_length = g8_desc[1].length;
+          const auto g8_write_type = g8_desc[1].type;
+          const auto g8_write_meta_data = g8_desc[1].meta_data;
+
+          uint32_t g8_f0_poll_handle = 0;
+          auto g8_f0_poll =
+              m->mem_mgr.alloc<struct cam_cmd_conditional_wait>(
+                  sizeof(struct cam_cmd_conditional_wait),
+                  &g8_f0_poll_handle);
+
+          g8_f0_poll->data_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_f0_poll->addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_f0_poll->op_code = G8_WAIT_OP_COND;
+          g8_f0_poll->cmd_type = CAMERA_SENSOR_CMD_TYPE_WAIT;
+          g8_f0_poll->timeout = 10;
+          g8_f0_poll->reserved = 0;
+          g8_f0_poll->reg_addr = 0xF0;
+          g8_f0_poll->reg_data = 0xA5;
+          g8_f0_poll->data_mask = 0xFF;
+
+          g8_desc[1].mem_handle = g8_f0_poll_handle;
+          g8_desc[1].offset = 0;
+          g8_desc[1].size = sizeof(struct cam_cmd_conditional_wait);
+          g8_desc[1].length = sizeof(struct cam_cmd_conditional_wait);
+          g8_desc[1].type = CAM_CMD_BUF_I2C;
+          g8_desc[1].meta_data = 0;
+
+          g8_act_pkt->header.op_code = 1;  // CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS
+          g8_act_pkt->header.request_id = 1;
+          g8_act_pkt->cmd_buf_offset = sizeof(struct cam_cmd_buf_desc);
+          g8_act_pkt->num_cmd_buf = 1;
+
+          errno = 0;
+          int g8_f0_poll_ret =
+              device_config(g8_act_fd,
+                            session_handle,
+                            *g8_act_handle,
+                            g8_act_packet_handle);
+          int g8_f0_poll_errno = errno;
+
+          fprintf(stderr,
+                  "G8_MAIN_FOCUS_ID_F0_V1 RET=%d ERRNO=%d reg=0xF0 expected=0xA5 timeout=10\n",
+                  g8_f0_poll_ret, g8_f0_poll_errno);
+          fflush(stderr);
+
+          // Restore descriptor 1 to the known-good one-byte actuator write buffer.
+          g8_desc[1].mem_handle = g8_write_mem_handle;
+          g8_desc[1].offset = g8_write_offset;
+          g8_desc[1].size = g8_write_size;
+          g8_desc[1].length = g8_write_length;
+          g8_desc[1].type = g8_write_type;
+          g8_desc[1].meta_data = g8_write_meta_data;
+
+          // G8_MAIN_FOCUS_WAKE_B3_EXACT_V1
+          // Conservative exact-byte readiness check.
+          // The reference driver only requires (B3 & 0xE0) == 0.
+          // Our Qualcomm WAIT parser does not reliably expose mask semantics,
+          // so B3 == 0x00 is a stronger sufficient condition, not a necessary one.
+          uint32_t g8_b3_poll_handle = 0;
+          auto g8_b3_poll =
+              m->mem_mgr.alloc<struct cam_cmd_conditional_wait>(
+                  sizeof(struct cam_cmd_conditional_wait),
+                  &g8_b3_poll_handle);
+
+          g8_b3_poll->data_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_b3_poll->addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_b3_poll->op_code = G8_WAIT_OP_COND;
+          g8_b3_poll->cmd_type = CAMERA_SENSOR_CMD_TYPE_WAIT;
+          g8_b3_poll->timeout = 10;
+          g8_b3_poll->reserved = 0;
+          g8_b3_poll->reg_addr = 0xB3;
+          g8_b3_poll->reg_data = 0x00;
+          g8_b3_poll->data_mask = 0xFF;
+
+          g8_desc[1].mem_handle = g8_b3_poll_handle;
+          g8_desc[1].offset = 0;
+          g8_desc[1].size = sizeof(struct cam_cmd_conditional_wait);
+          g8_desc[1].length = sizeof(struct cam_cmd_conditional_wait);
+          g8_desc[1].type = CAM_CMD_BUF_I2C;
+          g8_desc[1].meta_data = 0;
+
+          g8_act_pkt->header.op_code = 1;  // CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS
+          g8_act_pkt->header.request_id = 2;
+          g8_act_pkt->cmd_buf_offset = sizeof(struct cam_cmd_buf_desc);
+          g8_act_pkt->num_cmd_buf = 1;
+
+          errno = 0;
+          int g8_b3_poll_ret =
+              device_config(g8_act_fd,
+                            session_handle,
+                            *g8_act_handle,
+                            g8_act_packet_handle);
+          int g8_b3_poll_errno = errno;
+
+          fprintf(stderr,
+                  "G8_MAIN_FOCUS_WAKE_B3_EXACT_V1 RET=%d ERRNO=%d reg=0xB3 expected=0x00 timeout=10\n",
+                  g8_b3_poll_ret, g8_b3_poll_errno);
+          fflush(stderr);
+
+          // Restore descriptor 1 again for the known-good 0x8C write.
+          g8_desc[1].mem_handle = g8_write_mem_handle;
+          g8_desc[1].offset = g8_write_offset;
+          g8_desc[1].size = g8_write_size;
+          g8_desc[1].length = g8_write_length;
+          g8_desc[1].type = g8_write_type;
+          g8_desc[1].meta_data = g8_write_meta_data;
+
+          // Reuse descriptor 1 as a one-command AUTO_MOVE packet.
+          // AUTO_MOVE is applied immediately once actuator state is CONFIG.
+          g8_act_pkt->header.op_code = 1;  // CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS
+          g8_act_pkt->header.request_id = 3;
+          g8_act_pkt->cmd_buf_offset = sizeof(struct cam_cmd_buf_desc);
+          g8_act_pkt->num_cmd_buf = 1;
+
+          g8_init->header.count = 1;
+          g8_init->header.op_code = 1;
+          g8_init->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+          g8_init->header.data_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_init->header.addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+          g8_init->random_wr_payload[0].reg_addr = 0x8C;
+          g8_init->random_wr_payload[0].reg_data = 0xE9;
+
+          errno = 0;
+          int g8_act_wake_ret =
+              device_config(g8_act_fd,
+                            session_handle,
+                            *g8_act_handle,
+                            g8_act_packet_handle);
+          int g8_act_wake_errno = errno;
+
+          fprintf(stderr,
+                  "G8_MAIN_FOCUS_WAKE_8C_V1 RET=%d ERRNO=%d reg=0x8C val=0xE9\n",
+                  g8_act_wake_ret, g8_act_wake_errno);
+          fflush(stderr);
+
+          // G8_MAIN_FOCUS_DAC300_V1
+          // Permanent fixed MAIN road-camera lens position.
+          // Fixed code 100. LC898219XI DAC register 0x84 is WORD data.
+          if (g8_f0_poll_ret == 0 &&
+              g8_b3_poll_ret == 0 &&
+              g8_act_wake_ret == 0) {
+            usleep(10000);
+
+            g8_act_pkt->header.op_code = 1;  // CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS
+            g8_act_pkt->header.request_id = 4;
+            g8_act_pkt->cmd_buf_offset = sizeof(struct cam_cmd_buf_desc);
+            g8_act_pkt->num_cmd_buf = 1;
+
+            g8_init->header.count = 1;
+            g8_init->header.op_code = 1;
+            g8_init->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+            g8_init->header.data_type = CAMERA_SENSOR_I2C_TYPE_WORD;
+            g8_init->header.addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+            // G8_MAIN_FIXED_FOCUS_V1
+            // comma-style fixed road focus: initialize once, then never hunt while driving.
+            constexpr uint32_t G8_MAIN_FIXED_FOCUS_CODE = 100;
+            g8_init->random_wr_payload[0].reg_addr = 0x84;
+            g8_init->random_wr_payload[0].reg_data = G8_MAIN_FIXED_FOCUS_CODE;
+
+            errno = 0;
+            int g8_dac100_ret =
+                device_config(g8_act_fd,
+                              session_handle,
+                              *g8_act_handle,
+                              g8_act_packet_handle);
+            int g8_dac100_errno = errno;
+
+            fprintf(stderr,
+                    "G8_MAIN_FIXED_FOCUS_V1 RET=%d ERRNO=%d reg=0x84 data=0x%04X code=%d\n",
+                    g8_dac100_ret, g8_dac100_errno, (unsigned)G8_MAIN_FIXED_FOCUS_CODE, (int)G8_MAIN_FIXED_FOCUS_CODE);
+            fflush(stderr);
+
+            usleep(20000);
+          }
+        }
+
+        // G8_MAIN_FOCUS_CONFIG_RETRY_V1
+        // The INIT write is idempotent (0xE0=0x01). If Qualcomm CCI returns
+        // EAGAIN after the actuator has already reached CONFIG, wait 10 ms
+        // and submit the same INIT packet once more.
+        if (g8_act_cfg_ret != 0 && g8_act_cfg_errno == EAGAIN) {
+          usleep(10000);
+
+          errno = 0;
+          int g8_act_cfg_retry_ret =
+              device_config(g8_act_fd,
+                            session_handle,
+                            *g8_act_handle,
+                            g8_act_packet_handle);
+          int g8_act_cfg_retry_errno = errno;
+
+          fprintf(stderr,
+                  "G8_MAIN_FOCUS_CONFIG_RETRY_V1 RET=%d ERRNO=%d\n",
+                  g8_act_cfg_retry_ret, g8_act_cfg_retry_errno);
+          fflush(stderr);
+
+          if (g8_act_cfg_retry_ret == 0) {
+            g8_act_cfg_ret = 0;
+            g8_act_cfg_errno = 0;
+          }
+        }
+
+        // G8_MAIN_FOCUS_STATE_PROBE_V1
+        //
+        // CONFIG failed. Probe the actuator state without issuing any
+        // lens-position command. On the newer Qualcomm actuator state
+        // machine, CAM_START_DEV succeeds only after INIT reached CONFIG.
+        if (g8_act_cfg_ret != 0) {
+          errno = 0;
+          int g8_act_start_ret =
+              device_control(g8_act_fd,
+                             CAM_START_DEV,
+                             session_handle,
+                             *g8_act_handle);
+          int g8_act_start_errno = errno;
+
+          fprintf(stderr,
+                  "G8_MAIN_FOCUS_STATE_PROBE_V1 START_RET=%d ERRNO=%d\n",
+                  g8_act_start_ret, g8_act_start_errno);
+          fflush(stderr);
+
+          // Restore state if START succeeded.
+          if (g8_act_start_ret == 0) {
+            errno = 0;
+            int g8_act_stop_ret =
+                device_control(g8_act_fd,
+                               CAM_STOP_DEV,
+                               session_handle,
+                               *g8_act_handle);
+            int g8_act_stop_errno = errno;
+
+            fprintf(stderr,
+                    "G8_MAIN_FOCUS_STATE_PROBE_V1 STOP_RET=%d ERRNO=%d\n",
+                    g8_act_stop_ret, g8_act_stop_errno);
+            fflush(stderr);
+          }
+        }
+
+        // LG donor specifies ~1000 us following this init write.
+        usleep(1000);
+
+        int g8_act_release_ret =
+            device_control(g8_act_fd,
+                           CAM_RELEASE_DEV,
+                           session_handle,
+                           *g8_act_handle);
+
+        fprintf(stderr,
+                "G8_MAIN_FOCUS_INIT_V1 RELEASE ret=%d\n",
+                g8_act_release_ret);
+        fflush(stderr);
+      }
+
+      ::close(g8_act_fd);
+    }
+  }
+
+
+  if (getenv("G8_CAMERA_CONFIG_ONLY") != nullptr) {
+    const char *target =
+      getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ? "IMX520" :
+      (getenv("G8_CAMERA_TARGET_WIDE") != nullptr ? "IMX351" : "IMX363");
+    fprintf(stderr,
+            "G8_IMX520_CONFIG_V1 DONE sensor=%d target=%s enabled=%d writes=%zu size=%ux%u\n",
+            cc.camera_num, target, enabled ? 1 : 0, sensor->init_reg_array.size(),
+            sensor->frame_width, sensor->frame_height);
+    fflush(stderr);
+
+    // Stage 2 boundary: sensor is acquired and init/mode registers are
+    // programmed, but camera_open() must not reach ISP/CSIPHY/link/stream.
+    enabled = false;
+    return false;
+  }
+
   return true;
 }
 
 void SpectraCamera::configISP() {
   if (!enabled) return;
 
+  const bool g8_driver_isp =
+    getenv("G8_AGNOS") != nullptr &&
+    (cc.stream_type == VISION_STREAM_DRIVER ||
+     getenv("G8_CAMERA_TARGET_DRIVER") != nullptr);
+
   struct cam_isp_in_port_info in_port_info = {
     // ISP input to the CSID
     .res_type = cc.phy,
     .lane_type = CAM_ISP_LANE_TYPE_DPHY,
-    .lane_num = 4,
+    // G8_IMX520_CSID_2LANE_V1
+    // LG IMX520 mode is 2-lane D-PHY. Keep all proven rear cameras at 4 lanes.
+    .lane_num = static_cast<uint32_t>(g8_driver_isp ? 2 : 4),
+    // Stock LG sensormodule IMX520 laneAssign decodes exactly to 0x3210.
     .lane_cfg = 0x3210,
 
     .vc = 0x0,
@@ -1105,7 +2037,6 @@ void SpectraCamera::configISP() {
     .batch_size = 0x0,
     .dsp_mode = CAM_ISP_DSP_MODE_NONE,
     .hbi_cnt = 0x0,
-    .custom_csid = 0x0,
 
     // ISP outputs
     .num_out_res = 0x1,
@@ -1117,6 +2048,23 @@ void SpectraCamera::configISP() {
       .comp_grp_id = 0x0, .split_point = 0x0, .secure_mode = 0x0,
     },
   };
+
+  if (g8_driver_isp &&
+      (getenv("G8_CAMERA_FIRST_SOF") != nullptr ||
+       getenv("G8_CAMERA_FIRST_IFE") != nullptr ||
+       getenv("G8_CAMERA_STREAMON_ONLY") != nullptr)) {
+    fprintf(stderr,
+            "G8_IMX520_CSID_2LANE_V1 ISP_INPUT sensor=%d ife_phy=%u lane_num=%u lane_cfg=0x%X dt=0x%X format=%u size=%ux%u\n",
+            cc.camera_num,
+            cc.phy,
+            in_port_info.lane_num,
+            in_port_info.lane_cfg,
+            in_port_info.dt,
+            in_port_info.format,
+            sensor->frame_width,
+            sensor->frame_height);
+    fflush(stderr);
+  }
 
   if (cc.output_type != ISP_IFE_PROCESSED) {
     in_port_info.line_start = 0;
@@ -1138,6 +2086,10 @@ void SpectraCamera::configISP() {
   assert(isp_dev_handle_);
   isp_dev_handle = *isp_dev_handle_;
   LOGD("acquire isp dev");
+  if (getenv("G8_CAMERA_PHY_ONLY") != nullptr) {
+    fprintf(stderr, "G8_ISP_ACQUIRE_OK handle=0x%X\n", isp_dev_handle);
+    fflush(stderr);
+  }
 
   // allocate IFE memory, then configure it
   ife_cmd.init(m, 67984, 0x20, false, m->device_iommu, m->cdm_iommu, ife_buf_depth);
@@ -1147,17 +2099,52 @@ void SpectraCamera::configISP() {
     for (int i = 0; i < 3; i++) {
       memcpy(ife_gamma_lut.ptr + ife_gamma_lut.size*i, sensor->gamma_lut_rgb.data(), ife_gamma_lut.size);
     }
-    assert(sensor->linearization_lut.size() == 36);
-    ife_linearization_lut.init(m, sensor->linearization_lut.size()*sizeof(uint32_t), 0x20, false, m->device_iommu, m->cdm_iommu);
-    memcpy(ife_linearization_lut.ptr, sensor->linearization_lut.data(), ife_linearization_lut.size);
-    assert(sensor->vignetting_lut.size() == 221);
-    ife_vignetting_lut.init(m, sensor->vignetting_lut.size()*sizeof(uint32_t), 0x20, false, m->device_iommu, m->cdm_iommu, 2);
-    for (int i = 0; i < 2; i++) {
-      memcpy(ife_vignetting_lut.ptr + ife_vignetting_lut.size*i, sensor->vignetting_lut.data(), ife_vignetting_lut.size);
+    const bool has_linearization =
+        !sensor->linearization_pts.empty() &&
+        !sensor->linearization_lut.empty();
+
+    const bool has_vignetting =
+        cc.vignetting_correction &&
+        !sensor->vignetting_lut.empty();
+
+    if (has_linearization) {
+      assert(sensor->linearization_pts.size() == 4);
+      assert(sensor->linearization_lut.size() == 36);
+
+      ife_linearization_lut.init(
+          m,
+          sensor->linearization_lut.size() * sizeof(uint32_t),
+          0x20, false,
+          m->device_iommu, m->cdm_iommu);
+
+      memcpy(ife_linearization_lut.ptr,
+             sensor->linearization_lut.data(),
+             ife_linearization_lut.size);
+    }
+
+    if (has_vignetting) {
+      assert(sensor->vignetting_lut.size() == 221);
+
+      ife_vignetting_lut.init(
+          m,
+          sensor->vignetting_lut.size() * sizeof(uint32_t),
+          0x20, false,
+          m->device_iommu, m->cdm_iommu, 2);
+
+      for (int i = 0; i < 2; i++) {
+        memcpy(ife_vignetting_lut.ptr +
+                   ife_vignetting_lut.size * i,
+               sensor->vignetting_lut.data(),
+               ife_vignetting_lut.size);
+      }
     }
   }
 
   config_ife(0, 1, true);
+  if (getenv("G8_CAMERA_PHY_ONLY") != nullptr) {
+    fprintf(stderr, "G8_IFE_CONFIG_DONE\n");
+    fflush(stderr);
+  }
 }
 
 void SpectraCamera::configICP() {
@@ -1254,15 +2241,40 @@ void SpectraCamera::configICP() {
 }
 
 void SpectraCamera::configCSIPHY() {
-  csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", cc.camera_num);
+  int csiphy_index = cc.camera_num;
+  if (getenv("G8_AGNOS") != nullptr) {
+    if (getenv("G8_CAMERA_TARGET_WIDE") != nullptr) {
+      csiphy_index = 1;
+    } else if (getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ||
+               cc.stream_type == VISION_STREAM_DRIVER) {
+      csiphy_index = 2;
+    } else {
+      csiphy_index = 0;
+    }
+  }
+
+  csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", csiphy_index);
   assert(csiphy_fd >= 0);
-  LOGD("opened csiphy for %d", cc.camera_num);
+  LOGD("opened csiphy for camera %d at physical index %d", cc.camera_num, csiphy_index);
+  if (getenv("G8_CAMERA_PHY_ONLY") != nullptr || getenv("G8_CAMERA_START_ONLY") != nullptr) {
+    const char *target =
+      getenv("G8_CAMERA_TARGET_DRIVER") != nullptr ? "IMX520" :
+      (getenv("G8_CAMERA_TARGET_WIDE") != nullptr ? "IMX351" : "IMX363");
+    fprintf(stderr,
+            "G8_IMX520_START_V1 CSIPHY_OPEN target=%s camera_num=%d index=%d ife_phy=%u\n",
+            target, cc.camera_num, csiphy_index, cc.phy);
+    fflush(stderr);
+  }
 
   struct cam_csiphy_acquire_dev_info csiphy_acquire_dev_info = {.combo_mode = 0};
   auto csiphy_dev_handle_ = device_acquire(csiphy_fd, session_handle, &csiphy_acquire_dev_info);
   assert(csiphy_dev_handle_);
   csiphy_dev_handle = *csiphy_dev_handle_;
   LOGD("acquire csiphy dev");
+  if (getenv("G8_CAMERA_PHY_ONLY") != nullptr) {
+    fprintf(stderr, "G8_CSIPHY_ACQUIRE_OK handle=0x%X\n", csiphy_dev_handle);
+    fflush(stderr);
+  }
 
   // config csiphy
   LOG("-- Config CSI PHY");
@@ -1279,16 +2291,43 @@ void SpectraCamera::configCSIPHY() {
     buf_desc[0].type = CAM_CMD_BUF_GENERIC;
 
     auto csiphy_info = m->mem_mgr.alloc<struct cam_csiphy_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);
-    csiphy_info->lane_mask = 0x1f;
-    csiphy_info->lane_assign = 0x3210;// skip clk. How is this 16 bit for 5 channels??
-    csiphy_info->csiphy_3phase = 0x0; // no 3 phase, only 2 conductors per lane
+    const bool g8_driver_phy =
+      getenv("G8_AGNOS") != nullptr &&
+      (cc.stream_type == VISION_STREAM_DRIVER ||
+       getenv("G8_CAMERA_TARGET_DRIVER") != nullptr);
+    const bool g8_wide_phy =
+      getenv("G8_AGNOS") != nullptr && getenv("G8_CAMERA_TARGET_WIDE") != nullptr;
+
+    csiphy_info->lane_mask = g8_driver_phy ? 0x7 : 0x1f;
+    // Keep the already-proven LG physical mapping. With lane_cnt=2/mask=0x7,
+    // only the low two data-lane assignments (0,1) are active for IMX520.
+    csiphy_info->lane_assign = 0x3210;
+    csiphy_info->csiphy_3phase = 0x0;
     csiphy_info->combo_mode = 0x0;
-    csiphy_info->lane_cnt = 0x4;
+    csiphy_info->lane_cnt = g8_driver_phy ? 0x2 : 0x4;
     csiphy_info->secure_mode = 0x0;
     csiphy_info->settle_time = MIPI_SETTLE_CNT * 200000000ULL;
-    csiphy_info->data_rate = 48000000;  // Calculated by camera_freqs.py
+    csiphy_info->data_rate =
+      g8_driver_phy ? 168800000ULL :
+      (g8_wide_phy ? 82500000ULL : 48000000ULL);
+
+    if (getenv("G8_CAMERA_PHY_ONLY") != nullptr || getenv("G8_CAMERA_START_ONLY") != nullptr) {
+      const char *target = g8_driver_phy ? "IMX520" : (g8_wide_phy ? "IMX351" : "IMX363");
+      fprintf(stderr,
+              "G8_IMX520_PHY_V1 CSIPHY_PARAMS target=%s lanes=%u mask=0x%X assign=0x%X data_rate=%llu\n",
+              target,
+              csiphy_info->lane_cnt,
+              csiphy_info->lane_mask,
+              csiphy_info->lane_assign,
+              (unsigned long long)csiphy_info->data_rate);
+      fflush(stderr);
+    }
 
     int ret_ = device_config(csiphy_fd, session_handle, csiphy_dev_handle, cam_packet_handle);
+    if (getenv("G8_CAMERA_PHY_ONLY") != nullptr) {
+      fprintf(stderr, "G8_CSIPHY_CONFIG_RET=%d\n", ret_);
+      fflush(stderr);
+    }
     assert(ret_ == 0);
   }
 }
@@ -1301,6 +2340,10 @@ void SpectraCamera::linkDevices() {
   req_mgr_link_info.dev_hdls[0] = isp_dev_handle;
   req_mgr_link_info.dev_hdls[1] = sensor_dev_handle;
   int ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_LINK, &req_mgr_link_info, sizeof(req_mgr_link_info));
+  if (getenv("G8_CAMERA_START_ONLY") != nullptr) {
+    fprintf(stderr, "G8_LINK_RET=%d link=0x%X\n", ret, req_mgr_link_info.link_hdl);
+    fflush(stderr);
+  }
   assert(ret == 0);
   link_handle = req_mgr_link_info.link_hdl;
   LOGD("link: %d session: 0x%X isp: 0x%X sensors: 0x%X link: 0x%X", ret, session_handle, isp_dev_handle, sensor_dev_handle, link_handle);
@@ -1311,12 +2354,24 @@ void SpectraCamera::linkDevices() {
   req_mgr_link_control.num_links = 1;
   req_mgr_link_control.link_hdls[0] = link_handle;
   ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_LINK_CONTROL, &req_mgr_link_control, sizeof(req_mgr_link_control));
+  if (getenv("G8_CAMERA_START_ONLY") != nullptr) {
+    fprintf(stderr, "G8_LINK_ACTIVATE_RET=%d\n", ret);
+    fflush(stderr);
+  }
   LOGD("link control: %d", ret);
 
   ret = device_control(csiphy_fd, CAM_START_DEV, session_handle, csiphy_dev_handle);
+  if (getenv("G8_CAMERA_START_ONLY") != nullptr) {
+    fprintf(stderr, "G8_CSIPHY_START_RET=%d\n", ret);
+    fflush(stderr);
+  }
   LOGD("start csiphy: %d", ret);
   assert(ret == 0);
   ret = device_control(m->isp_fd, CAM_START_DEV, session_handle, isp_dev_handle);
+  if (getenv("G8_CAMERA_START_ONLY") != nullptr) {
+    fprintf(stderr, "G8_ISP_START_RET=%d\n", ret);
+    fflush(stderr);
+  }
   LOGD("start isp: %d", ret);
   assert(ret == 0);
   if (cc.output_type == ISP_BPS_PROCESSED) {
@@ -1327,9 +2382,14 @@ void SpectraCamera::linkDevices() {
 }
 
 void SpectraCamera::camera_close() {
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    fprintf(stderr, "G8_QUEUE_CLEANUP_BEGIN sensor=%d enabled=%d\n", cc.camera_num, enabled ? 1 : 0);
+    fflush(stderr);
+  }
   LOG("-- Stop devices %d", cc.camera_num);
 
-  if (enabled) {
+  if (enabled || getenv("G8_CAMERA_FIRST_SOF") != nullptr) {
+    sensors_stop();
     clear_req_queue();
 
     // ret = device_control(sensor_fd, CAM_STOP_DEV, session_handle, sensor_dev_handle);
@@ -1390,6 +2450,10 @@ void SpectraCamera::camera_close() {
   struct cam_req_mgr_session_info session_info = {.session_hdl = session_handle};
   ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_DESTROY_SESSION, &session_info, sizeof(session_info));
   LOGD("destroyed session %d: %d", cc.camera_num, ret);
+  if (getenv("G8_CAMERA_QUEUE_ONLY") != nullptr) {
+    fprintf(stderr, "G8_QUEUE_CLEANUP_DONE sensor=%d destroy_session_ret=%d\n", cc.camera_num, ret);
+    fflush(stderr);
+  }
 }
 
 bool SpectraCamera::handle_camera_event(const cam_req_mgr_message *event_data) {
@@ -1424,8 +2488,28 @@ bool SpectraCamera::handle_camera_event(const cam_req_mgr_message *event_data) {
   frame_id_raw_last = frame_id_raw;
   request_id_last = request_id;
 
+  // G8_FIRST_FRAME_CAMERA_SELECT_V1
+  // Optional selector for the existing first-IFE/dump harness. With
+  // G8_CAMERA_DUMP_CAMERA_NUM unset, behavior is unchanged. When set, only
+  // that logical camera number enters the first-IFE early-return/dump path.
+  const char *g8_dump_camera_num_env = getenv("G8_CAMERA_DUMP_CAMERA_NUM");
+  const bool g8_first_ife_selected =
+      getenv("G8_CAMERA_FIRST_IFE") != nullptr &&
+      (g8_dump_camera_num_env == nullptr || atoi(g8_dump_camera_num_env) == cc.camera_num);
+
   // Wait until frame's fully read out and processed
   if (!waitForFrameReady(request_id)) {
+    if (g8_first_ife_selected) {
+      fprintf(stderr,
+              "G8_FIRST_IFE_FAILED sensor=%d frame=%llu req=%llu\n",
+              cc.camera_num,
+              (unsigned long long)frame_id_raw,
+              (unsigned long long)request_id);
+      fflush(stderr);
+      g8_first_ife_complete = true;
+      return false;
+    }
+
     // Reset queue on sync failure to prevent frame tearing
     LOGE("camera %d sync failure %ld %ld ", cc.camera_num, request_id, frame_id_raw);
     clearAndRequeue(request_id + 1);
@@ -1433,6 +2517,360 @@ bool SpectraCamera::handle_camera_event(const cam_req_mgr_message *event_data) {
   }
 
   int buf_idx = request_id % ife_buf_depth;
+
+  // G8 stage 6: a valid SOF was followed by a signaled IFE output fence.
+  // Stop before processFrame()/multi-camera sync or VisionIPC publication.
+  if (g8_first_ife_selected) {
+    fprintf(stderr,
+            "G8_FIRST_IFE_COMPLETE sensor=%d frame=%llu req=%llu buf_idx=%d sync=%d yuv_handle=0x%X raw_handle=0x%X\n",
+            cc.camera_num,
+            (unsigned long long)frame_id_raw,
+            (unsigned long long)request_id,
+            buf_idx,
+            sync_objs_ife[buf_idx],
+            buf_handle_yuv[buf_idx],
+            buf_handle_raw[buf_idx]);
+    fflush(stderr);
+
+    if (getenv("G8_CAMERA_DUMP_FIRST_FRAME") != nullptr) {
+      VisionBuf *vb = buf.vipc_server->get_buffer(buf.stream_type, buf_idx);
+      const uint8_t *base = (const uint8_t *)vb->addr;
+      const uint8_t *y = vb->y;
+
+      fprintf(stderr,
+              "G8_FIRST_FRAME_LAYOUT visible=%ux%u stride=%u y_height=%u uv_height=%u uv_offset=%u yuv_size=%u vb_len=%zu fd=%d\n",
+              buf.out_img_width, buf.out_img_height, stride, y_height, uv_height,
+              uv_offset, yuv_size, vb->len, vb->fd);
+      fflush(stderr);
+
+      uint8_t min_y = 255;
+      uint8_t max_y = 0;
+      uint64_t sum_y = 0;
+      uint64_t nonzero_y = 0;
+      uint64_t samples = 0;
+
+      for (uint32_t row = 0; row < buf.out_img_height; ++row) {
+        const uint8_t *rowp = y + ((size_t)row * stride);
+        for (uint32_t col = 0; col < buf.out_img_width; ++col) {
+          uint8_t v = rowp[col];
+          if (v < min_y) min_y = v;
+          if (v > max_y) max_y = v;
+          sum_y += v;
+          nonzero_y += (v != 0);
+          samples++;
+        }
+      }
+
+      double mean_y = samples ? ((double)sum_y / (double)samples) : 0.0;
+      fprintf(stderr,
+              "G8_FIRST_FRAME_STATS samples=%llu min=%u max=%u mean=%.3f nonzero=%llu\n",
+              (unsigned long long)samples, (unsigned)min_y, (unsigned)max_y,
+              mean_y, (unsigned long long)nonzero_y);
+
+      fprintf(stderr, "G8_FIRST_FRAME_HEAD");
+      size_t head_n = yuv_size < 32 ? yuv_size : 32;
+      for (size_t i = 0; i < head_n; ++i) {
+        fprintf(stderr, " %02X", (unsigned)base[i]);
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+
+      const char *dump_path = "/data/g8-first-frame.nv12";
+      FILE *fp = fopen(dump_path, "wb");
+      if (fp == nullptr) {
+        fprintf(stderr, "G8_FIRST_FRAME_DUMP_OPEN_FAILED path=%s errno=%d\n", dump_path, errno);
+        fflush(stderr);
+      } else {
+        size_t wrote = fwrite(base, 1, yuv_size, fp);
+        int close_ret = fclose(fp);
+        fprintf(stderr,
+                "G8_FIRST_FRAME_DUMP path=%s wrote=%zu expected=%u close_ret=%d\n",
+                dump_path, wrote, yuv_size, close_ret);
+        fflush(stderr);
+      }
+    }
+
+    g8_first_ife_complete = true;
+    return false;
+  }
+  // G8_CAMERA_DYNAMIC_AWB_V4
+  // G8_COLOR_CAL_CAPTURE_V1
+  // One-shot settled-frame NV12 capture.
+  {
+    FILE *g8_cap_trigger = fopen("/data/G8_CAPTURE_COLOR_FRAME", "rb");
+    if (g8_cap_trigger != nullptr) {
+      fclose(g8_cap_trigger);
+
+      VisionBuf *g8_cap_vb = buf.vipc_server->get_buffer(buf.stream_type, buf_idx);
+      const uint8_t *g8_cap_base = (const uint8_t *)g8_cap_vb->addr;
+      const char *g8_cap_path = "/data/g8-color-calibration.nv12";
+
+      fprintf(stderr,
+              "G8_COLOR_CAL_LAYOUT visible=%ux%u stride=%u y_height=%u uv_height=%u uv_offset=%u yuv_size=%u\n",
+              buf.out_img_width, buf.out_img_height, stride, y_height, uv_height,
+              uv_offset, yuv_size);
+
+      FILE *g8_cap_fp = fopen(g8_cap_path, "wb");
+      if (g8_cap_fp == nullptr) {
+        fprintf(stderr, "G8_COLOR_CAL_CAPTURE_OPEN_FAILED path=%s errno=%d\n",
+                g8_cap_path, errno);
+      } else {
+        size_t g8_cap_wrote = fwrite(g8_cap_base, 1, yuv_size, g8_cap_fp);
+        int g8_cap_close_ret = fclose(g8_cap_fp);
+        fprintf(stderr,
+                "G8_COLOR_CAL_CAPTURE path=%s wrote=%zu expected=%u close_ret=%d\n",
+                g8_cap_path, g8_cap_wrote, yuv_size, g8_cap_close_ret);
+      }
+      fflush(stderr);
+      remove("/data/G8_CAPTURE_COLOR_FRAME");
+    }
+  }
+
+  // Stage 10D: extend the proven gain-normalized V3 controller to all three
+  // G8 camera roles with independent state and independent live IFE gains.
+  //
+  // DRIVER keeps its empirically proven target U=125/V=131.
+  // ROAD and WIDE use true neutral U=128/V=128 until sensor-specific road
+  // illumination characterization is available. Their actuator remains very
+  // conservative: one register count only after three persistent 1 Hz
+  // observations, with the same >=800 neutral-evidence gate and HOLD behavior.
+  //
+  // Enable:
+  //   G8_DYNAMIC_AWB_DRIVER=1  -> DRIVER only (backward compatible)
+  //   G8_DYNAMIC_AWB_ROAD=1    -> ROAD only
+  //   G8_DYNAMIC_AWB_WIDE=1    -> WIDE only
+  //   G8_DYNAMIC_AWB_REAR=1    -> ROAD + WIDE
+  //   G8_DYNAMIC_AWB_ALL=1     -> ROAD + DRIVER + WIDE
+  //
+  // No AE, sensor exposure/gain, CSI/CSID/PHY, Bayer, CCM or gamma changes.
+  const bool g8_awb_all = getenv("G8_DYNAMIC_AWB_ALL") != nullptr;
+  const bool g8_awb_rear = getenv("G8_DYNAMIC_AWB_REAR") != nullptr;
+  const bool g8_awb_is_driver = cc.stream_type == VISION_STREAM_DRIVER;
+  const bool g8_awb_is_wide =
+      cc.stream_type == VISION_STREAM_WIDE_ROAD ||
+      getenv("G8_CAMERA_TARGET_WIDE") != nullptr;
+  const bool g8_awb_is_road =
+      cc.stream_type == VISION_STREAM_ROAD &&
+      !g8_awb_is_wide && !g8_awb_is_driver;
+
+  const bool g8_dynamic_awb =
+      getenv("G8_AGNOS") != nullptr &&
+      ((g8_awb_is_driver &&
+        (g8_awb_all || getenv("G8_DYNAMIC_AWB_DRIVER") != nullptr)) ||
+       (g8_awb_is_road &&
+        (g8_awb_all || g8_awb_rear || getenv("G8_DYNAMIC_AWB_ROAD") != nullptr)) ||
+       (g8_awb_is_wide &&
+        (g8_awb_all || g8_awb_rear || getenv("G8_DYNAMIC_AWB_WIDE") != nullptr)));
+
+  if (g8_dynamic_awb) {
+    struct G8AwbState {
+      uint64_t last_ns = 0;
+      int dir_b = 0;
+      int dir_r = 0;
+      int persist_b = 0;
+      int persist_r = 0;
+      bool ema_valid = false;
+      int ema_u_q8 = 0;
+      int ema_v_q8 = 0;
+    };
+    // Key order is ROAD=0, DRIVER=1, WIDE=2; do not rely on enum numeric values.
+    static G8AwbState g8_awb_states[3];
+
+    int g8_awb_key = 0;
+    const char *g8_awb_stream = "ROAD";
+    uint32_t *g8_awb_gain_b = &g8_road_awb_gain_b;
+    uint32_t *g8_awb_gain_r = &g8_road_awb_gain_r;
+    int g8_target_u = 128;
+    int g8_target_v = 128;
+
+    if (g8_awb_is_driver) {
+      g8_awb_key = 1;
+      g8_awb_stream = "DRIVER";
+      g8_awb_gain_b = &g8_driver_awb_gain_b;
+      g8_awb_gain_r = &g8_driver_awb_gain_r;
+      g8_target_u = 125;
+      g8_target_v = 131;
+
+      // G8_IMX520_AWB_MAINLIKE_V3_FIXED
+      // DRIVER-only final stability test using the accepted MAIN-style CCM.
+      // The visually good point is G=0x80/B=0xCE/R=0xD8.  V1 (116/134) was
+      // scene-specific and V2 (128/128) still drifted away from this point.
+      // Keep 128/128 only as a diagnostic neutral reference; hold the actual
+      // DRIVER IFE gains at CE/D8 so colored/low-neutral scenes cannot push
+      // blue upward or red downward.
+      if (getenv("G8_IMX520_AWB_MAINLIKE") != nullptr) {
+        g8_target_u = 128;
+        g8_target_v = 128;
+        *g8_awb_gain_b = 0xCE;
+        *g8_awb_gain_r = 0xD8;
+
+        static bool g8_imx520_awb_mainlike_logged = false;
+        if (!g8_imx520_awb_mainlike_logged) {
+          g8_imx520_awb_mainlike_logged = true;
+          fprintf(stderr,
+                  "G8_IMX520_AWB_MAINLIKE_V3_FIXED enabled=1 "
+                  "fixedB=0xCE fixedR=0xD8 monitorTargetU=128 monitorTargetV=128\n");
+          fflush(stderr);
+        }
+      }
+    } else if (g8_awb_is_wide) {
+      g8_awb_key = 2;
+      g8_awb_stream = "WIDE";
+      g8_awb_gain_b = &g8_wide_awb_gain_b;
+      g8_awb_gain_r = &g8_wide_awb_gain_r;
+      g8_target_u = 128;
+      g8_target_v = 128;
+    }
+
+    G8AwbState &g8s = g8_awb_states[g8_awb_key];
+    const uint64_t g8_awb_now_ns = nanos_since_boot();
+
+    if (g8s.last_ns == 0 || g8_awb_now_ns - g8s.last_ns >= 1000000000ULL) {
+      g8s.last_ns = g8_awb_now_ns;
+
+      VisionBuf *g8_vb = buf.vipc_server->get_buffer(buf.stream_type, buf_idx);
+      const uint8_t *g8_y = g8_vb->y;
+      const uint8_t *g8_uv = (const uint8_t *)g8_vb->addr + uv_offset;
+
+      uint32_t g8_hist_u[256] = {};
+      uint32_t g8_hist_v[256] = {};
+      uint32_t g8_neutral_count = 0;
+
+      const uint32_t g8_uv_rows = buf.out_img_height / 2;
+      const uint32_t g8_uv_cols = buf.out_img_width / 2;
+
+      for (uint32_t r = 2; r + 2 < g8_uv_rows; r += 8) {
+        const uint8_t *uv_row = g8_uv + ((size_t)r * stride);
+        const uint8_t *y_row = g8_y + ((size_t)(r * 2) * stride);
+        for (uint32_t c = 2; c + 2 < g8_uv_cols; c += 8) {
+          const uint8_t yv = y_row[c * 2];
+          if (yv < 56 || yv > 220) continue;
+
+          const uint8_t u = uv_row[c * 2];
+          const uint8_t v = uv_row[c * 2 + 1];
+          const int du = (u > 128) ? (u - 128) : (128 - u);
+          const int dv = (v > 128) ? (v - 128) : (128 - v);
+          if (du > 28 || dv > 28 || (du + dv) > 36) continue;
+
+          g8_hist_u[u]++;
+          g8_hist_v[v]++;
+          g8_neutral_count++;
+        }
+      }
+
+      if (g8_neutral_count >= 800) {
+        auto g8_hist_median = [](const uint32_t *hist, uint32_t total) {
+          const uint32_t half = (total + 1) / 2;
+          uint32_t acc = 0;
+          for (int i = 0; i < 256; ++i) {
+            acc += hist[i];
+            if (acc >= half) return i;
+          }
+          return 128;
+        };
+
+        const int med_u = g8_hist_median(g8_hist_u, g8_neutral_count);
+        const int med_v = g8_hist_median(g8_hist_v, g8_neutral_count);
+
+        if (!g8s.ema_valid) {
+          g8s.ema_u_q8 = med_u << 8;
+          g8s.ema_v_q8 = med_v << 8;
+          g8s.ema_valid = true;
+        } else {
+          g8s.ema_u_q8 = (3 * g8s.ema_u_q8 + (med_u << 8) + 2) / 4;
+          g8s.ema_v_q8 = (3 * g8s.ema_v_q8 + (med_v << 8) + 2) / 4;
+        }
+
+        constexpr int G8_AWB_B_COUNTS_PER_U = 5;
+        constexpr int G8_AWB_R_COUNTS_PER_V = 3;
+
+        auto g8_div_q8_round = [](int q8_times_counts) {
+          if (q8_times_counts >= 0) return (q8_times_counts + 128) / 256;
+          return -((-q8_times_counts + 128) / 256);
+        };
+
+        int est_delta_b = g8_div_q8_round(
+            (((g8_target_u << 8) - g8s.ema_u_q8) * G8_AWB_B_COUNTS_PER_U));
+        int est_delta_r = g8_div_q8_round(
+            (((g8_target_v << 8) - g8s.ema_v_q8) * G8_AWB_R_COUNTS_PER_V));
+
+        est_delta_b = std::clamp(est_delta_b, -12, 12);
+        est_delta_r = std::clamp(est_delta_r, -9, 9);
+
+        const uint32_t old_b = *g8_awb_gain_b;
+        const uint32_t old_r = *g8_awb_gain_r;
+        const uint32_t target_b = (uint32_t)std::clamp(
+            (g8_awb_key == 1 ? 0xD0 : (g8_awb_key == 2 ? 0xD8 : 0xCE)) + est_delta_b, 0xB8, 0xF0);
+        const uint32_t target_r = (uint32_t)std::clamp(
+            (g8_awb_key == 1 ? 0xD8 : (g8_awb_key == 2 ? 0xB4 : 0xB4)) + est_delta_r, 0xB0, 0x100);
+
+        auto g8_target_direction = [](uint32_t current, uint32_t target) {
+          if ((int)target >= (int)current + 2) return 1;
+          if ((int)target <= (int)current - 2) return -1;
+          return 0;
+        };
+
+        const int raw_dir_b = g8_target_direction(old_b, target_b);
+        const int raw_dir_r = g8_target_direction(old_r, target_r);
+
+        auto g8_awb_persist = [](int raw_dir, int &last_dir, int &count) {
+          if (raw_dir == 0) {
+            last_dir = 0;
+            count = 0;
+            return 0;
+          }
+          if (raw_dir != last_dir) {
+            last_dir = raw_dir;
+            count = 1;
+            return 0;
+          }
+          count++;
+          if (count >= 3) {
+            count = 0;
+            return raw_dir;
+          }
+          return 0;
+        };
+
+        const int step_b = g8_awb_persist(raw_dir_b, g8s.dir_b, g8s.persist_b);
+        const int step_r = g8_awb_persist(raw_dir_r, g8s.dir_r, g8s.persist_r);
+
+        if (g8_awb_is_driver && getenv("G8_IMX520_AWB_MAINLIKE") != nullptr) {
+          *g8_awb_gain_b = 0xCE;
+          *g8_awb_gain_r = 0xD8;
+        } else {
+          *g8_awb_gain_b = (uint32_t)std::clamp((int)old_b + step_b, 0xB8, 0xF0);
+          *g8_awb_gain_r = (uint32_t)std::clamp((int)old_r + step_r, 0xB0, 0x100);
+        }
+
+        fprintf(stderr,
+                "G8_CAMERA_DYNAMIC_AWB_V4 stream=%s frame=%llu neutral=%u "
+                "medU=%d medV=%d emaUq8=%d emaVq8=%d targetU=%d targetV=%d "
+                "dB=%d dR=%d targetB=0x%X targetR=0x%X "
+                "rawB=%d pB=%d stepB=%d rawR=%d pR=%d stepR=%d "
+                "B=0x%X->0x%X R=0x%X->0x%X\n",
+                g8_awb_stream, (unsigned long long)frame_id_raw,
+                g8_neutral_count, med_u, med_v,
+                g8s.ema_u_q8, g8s.ema_v_q8, g8_target_u, g8_target_v,
+                est_delta_b, est_delta_r, target_b, target_r,
+                raw_dir_b, g8s.persist_b, step_b,
+                raw_dir_r, g8s.persist_r, step_r,
+                old_b, *g8_awb_gain_b, old_r, *g8_awb_gain_r);
+        fflush(stderr);
+      } else {
+        g8s.dir_b = g8s.dir_r = 0;
+        g8s.persist_b = g8s.persist_r = 0;
+        g8s.ema_valid = false;
+        fprintf(stderr,
+                "G8_CAMERA_DYNAMIC_AWB_V4 HOLD stream=%s frame=%llu neutral=%u "
+                "B=0x%X R=0x%X\n",
+                g8_awb_stream, (unsigned long long)frame_id_raw,
+                g8_neutral_count, *g8_awb_gain_b, *g8_awb_gain_r);
+        fflush(stderr);
+      }
+    }
+  }
+
   bool ret = processFrame(buf_idx, request_id, frame_id_raw, timestamp);
   destroySyncObjectAt(buf_idx);
   enqueue_frame(request_id + ife_buf_depth);  // request next frame for this slot
@@ -1520,6 +2958,33 @@ bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t fram
   // in IFE_PROCESSED mode, we can't know the true EOF, so recover it with sensor readout time
   uint64_t timestamp_eof = timestamp + sensor->readout_time_ns;
 
+  // G8_IFE_PROCESSING_TIME_V1
+  // On the G8 IFE path this callback can run before the estimated EOF.
+  // Avoid unsigned uint64 underflow from (now - future_eof), which otherwise
+  // appears in driverCameraState as ~1.844674e10 seconds. Do not alter the
+  // SOF/EOF timestamps themselves; only saturate the derived duration at 0.
+  const uint64_t processing_now_ns = nanos_since_boot();
+  const bool g8_ife_future_eof =
+      getenv("G8_AGNOS") != nullptr &&
+      cc.output_type == ISP_IFE_PROCESSED &&
+      processing_now_ns < timestamp_eof;
+  const float frame_processing_time = g8_ife_future_eof ? 0.0f :
+      float((processing_now_ns - timestamp_eof) * 1e-9);
+
+  if (g8_ife_future_eof &&
+      getenv("G8_IMX520_DRIVER_STREAM_TEST") != nullptr) {
+    static bool g8_processing_time_clamp_logged = false;
+    if (!g8_processing_time_clamp_logged) {
+      fprintf(stderr,
+              "G8_IFE_PROCESSING_TIME_V1 CLAMP now=%llu eof=%llu delta_ns=%llu processing=0\n",
+              (unsigned long long)processing_now_ns,
+              (unsigned long long)timestamp_eof,
+              (unsigned long long)(timestamp_eof - processing_now_ns));
+      fflush(stderr);
+      g8_processing_time_clamp_logged = true;
+    }
+  }
+
   // Update buffer and frame data
   buf.cur_buf_idx = buf_idx;
   buf.cur_frame_data = {
@@ -1527,7 +2992,7 @@ bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t fram
     .request_id = (uint32_t)request_id,
     .timestamp_sof = timestamp,
     .timestamp_eof = timestamp_eof,
-    .processing_time = float((nanos_since_boot() - timestamp_eof) * 1e-9)
+    .processing_time = frame_processing_time
   };
   return true;
 }
@@ -1538,10 +3003,21 @@ bool SpectraCamera::syncFirstFrame(int camera_id, uint64_t request_id, uint64_t 
   // Store the frame data for this camera
   camera_sync_data[camera_id] = SyncData{timestamp, raw_id + 1, staggered};
 
-  // Ensure all cameras are up
-  int enabled_camera_count = std::count_if(std::begin(ALL_CAMERA_CONFIGS), std::end(ALL_CAMERA_CONFIGS),
-                                           [](const auto &config) { return config.enabled; });
+  // Ensure all cameras are up. The LG G8 port intentionally instantiates
+  // only the road camera, while ALL_CAMERA_CONFIGS still contains the comma
+  // wide/driver entries. Treat the G8 as a one-camera platform here.
+  int enabled_camera_count = getenv("G8_AGNOS") != nullptr ? 1 :
+    std::count_if(std::begin(ALL_CAMERA_CONFIGS), std::end(ALL_CAMERA_CONFIGS),
+                  [](const auto &config) { return config.enabled; });
   bool all_cams_up = camera_sync_data.size() == enabled_camera_count;
+
+  if (getenv("G8_CAMERA_VIPC_TEST") != nullptr && !first_frame_synced) {
+    fprintf(stderr,
+            "G8_SINGLE_CAMERA_SYNC camera=%d registered=%zu expected=%d raw_id=%llu request=%llu\n",
+            camera_id, camera_sync_data.size(), enabled_camera_count,
+            (unsigned long long)raw_id, (unsigned long long)request_id);
+    fflush(stderr);
+  }
 
   // Check that camera timestamps are properly aligned:
   // - non-staggered cameras should be within 0.2ms of each other

@@ -1,0 +1,13 @@
+[Unit]
+Description=LG G8 / SM8150 AGNOS hardware and storage init
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=local-fs.target network-pre.target NetworkManager.service g8-seed-sunnypilot.service g8-openpilot.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/comma/g8-init.sh
+
+[Install]
+WantedBy=sysinit.target

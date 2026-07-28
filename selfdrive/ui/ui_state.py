@@ -1,5 +1,6 @@
 import pyray as rl
 import numpy as np
+import os
 import time
 import threading
 from collections.abc import Callable
@@ -335,7 +336,13 @@ class Device(DeviceSP):
         callback()
     self._prev_timed_out = interaction_timeout
 
-    self._set_awake(ui_state.ignition or not interaction_timeout or PC)
+    # G8_CAMERA_UI_KEEPAWAKE_V1
+    # /data/G8_CAMERA_UI_TEST exposes a live camera while the device remains
+    # logically offroad. Normal offroad wakefulness times out after 30 seconds,
+    # which disables UI rendering until the next touch. Keep rendering only
+    # while this explicit G8 camera-test flag exists; normal behavior is unchanged.
+    g8_camera_ui_keepawake = os.path.exists("/data/G8_CAMERA_UI_TEST")
+    self._set_awake(g8_camera_ui_keepawake or ui_state.ignition or not interaction_timeout or PC)
 
   def _set_awake(self, on: bool):
     if on != self._awake:

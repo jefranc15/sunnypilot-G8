@@ -1,0 +1,12 @@
+[Unit]
+Description=LG G8 modem device prerequisites
+After=systemd-udevd.service local-fs.target
+Before=rmt_storage.service init_sys_mss.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/comma/g8-modem-prereq.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

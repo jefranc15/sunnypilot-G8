@@ -1,0 +1,6 @@
+LIBSELINUX_R {
+  global:
+    selinux_check_access;
+  local:
+    *;
+};

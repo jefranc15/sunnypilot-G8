@@ -1,0 +1,14 @@
+[Unit]
+Description=Seed pinned sunnypilot into G8 userdata
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-openpilot.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=G8_SUNNYPILOT_TAG=v2026.002.002
+ExecStart=/usr/comma/g8-seed-sunnypilot.sh
+
+[Install]
+WantedBy=multi-user.target

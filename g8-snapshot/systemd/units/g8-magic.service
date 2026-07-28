@@ -1,0 +1,18 @@
+[Unit]
+Description=LG G8 DRM FD broker
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-openpilot.service
+
+[Service]
+Type=simple
+User=comma
+Group=comma
+PermissionsStartOnly=true
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/bash -c "mkdir -p /data/misc/display && printf '0\n' > /data/misc/display/sdm_dbg_cfg.txt && printf '0\n' > /data/misc/display/gbm_dbg_cfg.txt"
+ExecStart=/usr/local/venv/bin/python -u /usr/comma/magic.py
+Restart=on-failure
+RestartSec=1
+StandardOutput=append:/data/g8-magic.log
+StandardError=append:/data/g8-magic.log

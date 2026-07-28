@@ -12,7 +12,7 @@ from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.transformations.model import dmonitoringmodel_intrinsics
-from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
+from openpilot.common.transformations.camera import CameraConfig, _ar_ox_fisheye, _os_fisheye
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.file_chunker import read_file_chunked
 from openpilot.selfdrive.modeld.parse_model_outputs import sigmoid, safe_exp
@@ -125,14 +125,50 @@ def main():
   calib = np.zeros(model.numpy_inputs['calib'].size, dtype=np.float32)
   model_transform = None
 
+  # G8 IMX520 30fps camera -> 20Hz driverStateV2 test cadence.
+  # Process/publish 2 of every 3 received frames only when explicitly gated.
+  # G8_DUAL_ROAD_DRIVER_V2: the production IMX520 DRIVER stream is
+  # 1640x924 at 30 fps. Preserve the declared driverStateV2 service rate
+  # by processing/publishing 2 of every 3 input frames = 20 Hz.
+  g8_dmon_rate_v1 = (
+    os.getenv("G8_AGNOS") is not None and
+    vipc_client.width == 1640 and vipc_client.height == 924
+  )
+  g8_dmon_rate_seq = 0
+  if g8_dmon_rate_v1:
+    cloudlog.warning("G8_IMX520_DMON_RATE_V1 input_fps=30 output_hz=20 pattern=process2_skip1")
+
   while True:
     buf = vipc_client.recv()
     if buf is None:
       continue
 
+    if g8_dmon_rate_v1:
+      g8_dmon_rate_seq += 1
+      if g8_dmon_rate_seq % 3 == 0:
+        continue
+
     if model_transform is None:
-      cam = _os_fisheye if buf.width == _os_fisheye.width else _ar_ox_fisheye
+      # G8_IMX520_DMON_GEOMETRY_V1
+      # LG G8 IMX520 mode is hardware-proven 2x2 binning:
+      # 3280x1848 crop -> 1640x924 output. Native pixel pitch is 1.22 um.
+      # Test focal is 2.92 mm / 2.44 um = 1196.721311 px.
+      g8_imx520_geometry = (
+        os.getenv("G8_AGNOS") is not None and
+        buf.width == 1640 and buf.height == 924
+      )
+      if g8_imx520_geometry:
+        cam = CameraConfig(1640, 924, 1196.7213114754097)
+        cloudlog.warning(
+          f"G8_IMX520_DMON_GEOMETRY_V1 width={cam.width} height={cam.height} "
+          f"focal_px={cam.focal_length:.6f} cx={cam.width/2:.3f} cy={cam.height/2:.3f}"
+        )
+      else:
+        cam = _os_fisheye if buf.width == _os_fisheye.width else _ar_ox_fisheye
+
       model_transform = np.linalg.inv(np.dot(dmonitoringmodel_intrinsics, np.linalg.inv(cam.intrinsics))).astype(np.float32)
+      if g8_imx520_geometry:
+        cloudlog.warning(f"G8_IMX520_DMON_GEOMETRY_V1 transform={model_transform.tolist()}")
 
     sm.update(0)
     if sm.updated["liveCalibration"]:

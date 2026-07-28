@@ -73,10 +73,16 @@ float calculate_exposure_value(const CameraBuf *b, Rect ae_xywh, int x_skip, int
   uint32_t lum_binning[256] = {0};
   const uint8_t *pix_ptr = b->cur_yuv_buf->y;
 
+  // G8_AE_STRIDE_FIX_V1
+  // VisionIPC Y rows may be padded: width is the visible pixel count,
+  // while stride is the actual byte distance between consecutive Y rows.
+  // AE must walk the real Y layout or it samples shifted rows/padding.
+  const size_t y_stride = b->cur_yuv_buf->stride;
+
   unsigned int lum_total = 0;
   for (int y = ae_xywh.y; y < ae_xywh.y + ae_xywh.h; y += y_skip) {
     for (int x = ae_xywh.x; x < ae_xywh.x + ae_xywh.w; x += x_skip) {
-      uint8_t lum = pix_ptr[(y * b->out_img_width) + x];
+      uint8_t lum = pix_ptr[(y * y_stride) + x];
       lum_binning[lum]++;
       lum_total += 1;
     }

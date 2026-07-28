@@ -1,0 +1,20 @@
+[Unit]
+Description=sunnypilot on LG G8
+Requires=g8-init.service
+After=g8-init.service g8-seed-sunnypilot.service
+ConditionPathExists=/data/openpilot/launch_g8.sh
+
+[Service]
+Type=simple
+User=comma
+Group=comma
+WorkingDirectory=/data/openpilot
+Environment=HOME=/home/comma
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/data/openpilot/launch_g8.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

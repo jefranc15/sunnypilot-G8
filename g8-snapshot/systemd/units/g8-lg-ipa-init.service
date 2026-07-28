@@ -1,0 +1,13 @@
+[Unit]
+Description=LG G8 IPA firmware initialization
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-lg-cnss.service g8-lg-qcwlan-on.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/comma/g8-lg-ipa-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

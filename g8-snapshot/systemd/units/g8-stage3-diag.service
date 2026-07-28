@@ -1,0 +1,11 @@
+[Unit]
+Description=LG G8 Stage3 WLAN UI diagnostics
+Requires=g8-init.service g8-lg-pd-mapper.service
+After=g8-init.service g8-lg-pd-mapper.service
+
+[Service]
+Type=simple
+ExecStart=/usr/comma/g8-stage3-diag.sh
+
+[Install]
+WantedBy=multi-user.target

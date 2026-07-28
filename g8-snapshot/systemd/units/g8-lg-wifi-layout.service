@@ -1,0 +1,14 @@
+[Unit]
+Description=LG G8 native WLAN vendor layout
+Requires=g8-init.service
+After=g8-init.service
+Before=g8-lg-qcwlan-on.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/comma/g8-lg-wifi-layout.sh
+RemainAfterExit=yes
+TimeoutStartSec=75
+
+[Install]
+WantedBy=multi-user.target

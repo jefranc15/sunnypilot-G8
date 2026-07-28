@@ -1,0 +1,17 @@
+diff --git a/tinygrad/runtime/support/compiler_qcom.py b/tinygrad/runtime/support/compiler_qcom.py
+index ceb8f270b..162b23779 100644
+--- a/tinygrad/runtime/support/compiler_qcom.py
++++ b/tinygrad/runtime/support/compiler_qcom.py
+@@ -9,8 +9,10 @@ def _read_lib(lib, off) -> int: return struct.unpack("I", lib[off:off+4])[0]
+ 
+ class QCOMCompiler(Compiler):
+   def __init__(self, arch:str):
+-    assert arch.split(',')[0] == "a630", "only a630 supported"
+-    self.arch, self.chip_id, self.llvm_inst = arch, 0x6030001, llvm_qcom.cl_compiler_create_llvm_instance()
++    gpu = arch.split(',')[0]
++    chip_ids = {"a630": 0x6030001, "a640": 0x6040001}
++    assert gpu in chip_ids, f"unsupported QCOM GPU: {gpu}"
++    self.arch, self.chip_id, self.llvm_inst = arch, chip_ids[gpu], llvm_qcom.cl_compiler_create_llvm_instance()
+     super().__init__(f"compile_qcomcl_{arch}")
+ 
+   def __del__(self): llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst)

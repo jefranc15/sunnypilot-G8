@@ -58,6 +58,7 @@ public:
   uint32_t probe_reg_addr;
   uint32_t probe_expected_data;
   std::vector<i2c_random_wr_payload> start_reg_array;
+  std::vector<i2c_random_wr_payload> stop_reg_array;
   std::vector<i2c_random_wr_payload> init_reg_array;
 
   uint32_t bits_per_pixel;
@@ -100,5 +101,36 @@ public:
   OS04C10();
   std::vector<i2c_random_wr_payload> getExposureRegisters(int exposure_time, int new_exp_g, bool dc_gain_enabled) const override;
   float getExposureScore(float desired_ev, int exp_t, int exp_g_idx, float exp_gain, int gain_idx) const override;
+  int getSlaveAddress(int port) const override;
+};
+
+class IMX363G8 : public SensorInfo {
+public:
+  IMX363G8();
+  std::vector<i2c_random_wr_payload> getExposureRegisters(
+      int exposure_time, int new_exp_g, bool dc_gain_enabled) const override;
+  float getExposureScore(
+      float desired_ev, int exp_t, int exp_g_idx,
+      float exp_gain, int gain_idx) const override;
+  int getSlaveAddress(int port) const override;
+};
+
+// G8_IMX351_NO_OS04_AE_V1
+// LG IMX351 must not inherit comma's OS04C10 ISP/exposure implementation.
+class IMX351G8 : public SensorInfo {
+public:
+  IMX351G8();
+  std::vector<i2c_random_wr_payload> getExposureRegisters(
+      int exposure_time, int new_exp_g, bool dc_gain_enabled) const override;
+  float getExposureScore(
+      float desired_ev, int exp_t, int exp_g_idx,
+      float exp_gain, int gain_idx) const override;
+  int getSlaveAddress(int port) const override;
+};
+
+class IMX520G8 : public OS04C10 {
+public:
+  IMX520G8();
+  std::vector<i2c_random_wr_payload> getExposureRegisters(int exposure_time, int new_exp_g, bool dc_gain_enabled) const override;
   int getSlaveAddress(int port) const override;
 };

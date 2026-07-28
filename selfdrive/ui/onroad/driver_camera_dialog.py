@@ -67,6 +67,10 @@ class DriverCameraDialog(CameraView):
     fbox_x = int(1080.0 - 1714.0 * face_x)
     fbox_y = int(-135.0 + (504.0 + abs(face_x) * 112.0) + (1205.0 - abs(face_x) * 724.0) * face_y)
     box_size = 220
+    if self.frame and self.frame.width == 1640 and self.frame.height == 924:
+      g8_face_y_scale = (924.0 / 1640.0) / (1208.0 / 1928.0)
+      fbox_x = int(rect.x + rect.width / 2.0 - 4253.0 * face_x * rect.width / 2160.0)
+      fbox_y = int(rect.y + rect.height / 2.0 + (fbox_y - 540.0) * g8_face_y_scale * rect.height / 1080.0)
 
     line_color = rl.Color(255, 255, 255, int(alpha * 255))
     rl.draw_rectangle_rounded_lines_ex(

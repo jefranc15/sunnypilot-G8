@@ -16,7 +16,7 @@ def get_camera_configs():
     "tizi": (_ar_ox_fisheye.width, _ar_ox_fisheye.height),
     "mici": (_os_fisheye.width, _os_fisheye.height),
   }
-  if release or PC or 'CI' in os.environ:
+  if release or PC or 'CI' in os.environ or 'G8_AGNOS' in os.environ:
     return set(DEVICE_RESOLUTIONS.values())
   return [DEVICE_RESOLUTIONS[HARDWARE.get_device_type()]]
 

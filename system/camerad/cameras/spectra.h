@@ -48,8 +48,10 @@ enum {
 
   I2C_FAST_MODE = 1,
 
+  CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMON = 0,
   CAM_SENSOR_PACKET_OPCODE_SENSOR_PROBE = 3,
   CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG = 4,
+  CAM_SENSOR_PACKET_OPCODE_SENSOR_STREAMOFF = 5,
   CAM_SENSOR_PACKET_OPCODE_SENSOR_NOP = 127,
 };
 
@@ -148,6 +150,7 @@ public:
 
   int sensors_init();
   void sensors_start();
+  void sensors_stop();
   void sensors_poke(int request_id);
   void sensors_i2c(const struct i2c_random_wr_payload* dat, int len, int op_code, bool data_word);
 
@@ -163,6 +166,8 @@ public:
   int ife_buf_depth = -1;
   bool open = false;
   bool enabled = true;
+  bool sensor_started = false;
+  bool g8_first_ife_complete = false;
   CameraConfig cc;
   std::unique_ptr<const SensorInfo> sensor;
 

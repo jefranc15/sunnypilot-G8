@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import os
 from enum import Enum
 
 from cereal import messaging, log, car, custom
@@ -230,10 +231,17 @@ class DeviceSP:
 
   @staticmethod
   def set_onroad_brightness(_ui_state, awake: bool, cur_brightness: float) -> float:
-    if not awake or not _ui_state.started:
+    # G8_DUMMY_BRIGHTNESS_V1
+    # Dummy onroad remains logically offroad. Allow the onroad brightness
+    # setting while either explicit G8 dummy marker is active.
+    g8_dummy = (os.path.exists("/data/G8_CAMERA_UI_TEST") or
+                os.path.exists("/run/systemd/system/g8-openpilot.service.d/90-dummy-honda-e.conf")) and not _ui_state.started
+
+    if not awake or (not _ui_state.started and not g8_dummy):
       return cur_brightness
 
-    if _ui_state.onroad_brightness_timer != 0:
+    # Dummy mode has no real started transition, so apply immediately.
+    if not g8_dummy and _ui_state.onroad_brightness_timer != 0:
       if _ui_state.onroad_brightness == OnroadBrightness.AUTO_DARK:
         return max(30.0, cur_brightness)
       return cur_brightness

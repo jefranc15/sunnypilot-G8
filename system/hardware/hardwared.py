@@ -60,11 +60,75 @@ prev_offroad_states: dict[str, tuple[bool, str | None]] = {}
 
 
 
+def g8_get_network_strength(network_type):
+  """LG G8 fallback for real Wi-Fi RSSI when stock backend reports unknown."""
+  strength = HARDWARE.get_network_strength(network_type)
+
+  is_g8 = os.getenv("G8_AGNOS") == "1" or os.path.isdir("/opt/lg-android/vendor")
+  if not is_g8 or network_type != NetworkType.wifi or strength != NetworkStrength.unknown:
+    return strength
+
+  try:
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+      sock.settimeout(1.0)
+      sock.bind("\0g8-hardwared-%d-%d" % (os.getpid(), time.monotonic_ns()))
+      sock.connect("/run/wpa_supplicant/wlan0")
+      sock.send(b"SIGNAL_POLL")
+
+      while True:
+        out = sock.recv(8192).decode("utf-8", "replace")
+        if out.startswith("<"):
+          continue
+        break
+
+    rssi_line = next((line for line in out.splitlines() if line.startswith("RSSI=")), None)
+    if rssi_line is None:
+      return strength
+
+    dbm = int(rssi_line.split("=", 1)[1])
+    if not (-100 < dbm <= 0):
+      return strength
+
+    percentage = 120 + max(-100, min(-20, dbm))
+    if percentage < 25:
+      return NetworkStrength.poor
+    elif percentage < 50:
+      return NetworkStrength.moderate
+    elif percentage < 75:
+      return NetworkStrength.good
+    else:
+      return NetworkStrength.great
+  except Exception:
+    return strength
+
 def set_offroad_alert_if_changed(offroad_alert: str, show_alert: bool, extra_text: str | None=None):
   if prev_offroad_states.get(offroad_alert, None) == (show_alert, extra_text):
     return
   prev_offroad_states[offroad_alert] = (show_alert, extra_text)
   set_offroad_alert(offroad_alert, show_alert, extra_text)
+
+def get_touch_device_path():
+  if not os.path.isfile("/G8"):
+    return "/dev/input/by-path/platform-894000.i2c-event"
+
+  try:
+    entries = os.listdir("/sys/class/input")
+  except OSError:
+    return None
+
+  for name in sorted(entries):
+    if not name.startswith("event"):
+      continue
+    try:
+      with open(f"/sys/class/input/{name}/device/name") as name_file:
+        if name_file.read().strip() == "touch_dev":
+          return f"/dev/input/{name}"
+    except OSError:
+      continue
+
+  return None
+
 
 def touch_thread(end_event):
   count = 0
@@ -75,7 +139,11 @@ def touch_thread(end_event):
   event_size = struct.calcsize(event_format)
   event_frame = []
 
-  with open("/dev/input/by-path/platform-894000.i2c-event", "rb") as event_file:
+  touch_path = get_touch_device_path()
+  if touch_path is None:
+    return
+
+  with open(touch_path, "rb") as event_file:
     fcntl.fcntl(event_file, fcntl.F_SETFL, os.O_NONBLOCK)
     while not end_event.is_set():
       if (count % int(1. / DT_HW)) == 0:
@@ -129,7 +197,7 @@ def hw_state_thread(end_event, hw_queue):
         hw_state = HardwareState(
           network_type=network_type,
           network_info=HARDWARE.get_network_info(),
-          network_strength=HARDWARE.get_network_strength(network_type),
+          network_strength=g8_get_network_strength(network_type),
           network_stats={'wwanTx': tx, 'wwanRx': rx},
           network_metered=HARDWARE.get_network_metered(network_type),
           modem_temps=modem_temps,
@@ -313,7 +381,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     # - TIZI, or
     # - TICI and channel_type is "tici"
     build_metadata = get_build_metadata()
-    is_unsupported_combo = TICI and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici"
+    is_unsupported_combo = TICI and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici" and os.getenv("G8_DUMMY_ALLOW_ONROAD") != "1"
     startup_conditions["not_tici"] = not is_unsupported_combo
     onroad_conditions["not_tici"] = not is_unsupported_combo
     set_offroad_alert("Offroad_TiciSupport", is_unsupported_combo, extra_text=build_metadata.channel)

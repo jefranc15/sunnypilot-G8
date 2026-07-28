@@ -859,7 +859,7 @@ class GuiApplication(GuiApplicationExt):
 
   @staticmethod
   def _default_width() -> int:
-    return 2160 if GuiApplication.big_ui() else 536
+    return 2340 if GuiApplication.big_ui() else 536
 
   @staticmethod
   def _default_height() -> int:

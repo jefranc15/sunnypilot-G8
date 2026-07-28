@@ -94,6 +94,11 @@ def polling_loop(sensor: Sensor, service: str, event: threading.Event) -> None:
 def main() -> None:
   config_realtime_process([1, ], 1)
 
+  if os.getenv("G8_AGNOS") == "1" or os.path.isdir("/opt/lg-android/vendor"):
+    from openpilot.system.sensord.g8_ssc import run_g8_ssc_sensord
+    run_g8_ssc_sensord()
+    return
+
   sensors_cfg = [
     (LSM6DS3_Accel(I2C_BUS_IMU), "accelerometer", True),
     (LSM6DS3_Gyro(I2C_BUS_IMU), "gyroscope", True),
