@@ -232,6 +232,9 @@ def extract_casync_image(target_slot_number: int, partition: dict, cloudlog):
 
 
 def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalone=False):
+  if os.path.isfile("/G8"):
+    raise RuntimeError("AGNOS partition flashing is permanently disabled on LG G8")
+
   cloudlog.info(f"Downloading and writing {partition['name']}")
 
   if verify_partition(target_slot_number, partition):
@@ -258,6 +261,9 @@ def flash_partition(target_slot_number: int, partition: dict, cloudlog, standalo
 
 
 def swap(manifest_path: str, target_slot_number: int, cloudlog) -> None:
+  if os.path.isfile("/G8"):
+    raise RuntimeError("AGNOS slot switching is permanently disabled on LG G8")
+
   update = json.load(open(manifest_path))
   for partition in update:
     if not partition.get('full_check', False):
@@ -273,6 +279,9 @@ def swap(manifest_path: str, target_slot_number: int, cloudlog) -> None:
 
 
 def flash_agnos_update(manifest_path: str, target_slot_number: int, cloudlog, standalone=False) -> None:
+  if os.path.isfile("/G8"):
+    raise RuntimeError("AGNOS update is permanently disabled on LG G8")
+
   update = json.load(open(manifest_path))
 
   cloudlog.info(f"Target slot {target_slot_number}")

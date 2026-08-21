@@ -194,6 +194,10 @@ def finalize_update() -> None:
 
 
 def handle_agnos_update() -> None:
+  if os.path.isfile("/G8"):
+    cloudlog.warning("LG G8: AGNOS OS updates are permanently disabled")
+    return
+
   from openpilot.system.hardware.tici.agnos import flash_agnos_update, get_target_slot_number
 
   cur_version = HARDWARE.get_os_version()
@@ -390,7 +394,7 @@ class Updater:
     cloudlog.info("git reset success: %s", '\n'.join(r))
 
     # TODO: show agnos download progress
-    if AGNOS:
+    if AGNOS and not os.path.isfile("/G8"):
       handle_agnos_update()
 
     # Create the finalized, ready-to-swap update
