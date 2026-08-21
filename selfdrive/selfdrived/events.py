@@ -69,6 +69,11 @@ def user_soft_disable_alert(alert_text_2: str) -> AlertCallbackType:
   return func
 
 def startup_master_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  # LG G8 port uses a custom branch by design; keep the normal startup safety message
+  # instead of the generic untested-branch warning.
+  if os.path.isfile("/G8"):
+    return StartupAlert("Be ready to take over at any time")
+
   branch = get_short_branch()  # Ensure get_short_branch is cached to avoid lags on startup
   if "REPLAY" in os.environ:
     branch = "replay"
