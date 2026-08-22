@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdio>
 #include <string>
 #include <sys/ioctl.h>
 #include <poll.h>
@@ -216,6 +217,20 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
       { .id = V4L2_CID_MPEG_VIDC_VIDEO_IDR_PERIOD, .value = 1},
     };
     for (auto ctrl : ctrls) {
+      if ((getenv("G8_AGNOS") != nullptr) && (ctrl.id == V4L2_CID_MPEG_VIDC_VIDEO_RATE_CONTROL)) {
+        struct v4l2_control g8_rc = {
+          .id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+          .value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR,
+        };
+        util::safe_ioctl(fd, VIDIOC_S_CTRL, &g8_rc, "G8 BITRATE_MODE VBR failed");
+
+        struct v4l2_control g8_rc_check = {
+          .id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+        };
+        util::safe_ioctl(fd, VIDIOC_G_CTRL, &g8_rc_check, "G8 BITRATE_MODE readback failed");
+        LOGW("G8_V4L2_BITRATE_MODE readback=%d", g8_rc_check.value);
+        continue;
+      }
       util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL failed");
     }
   }
@@ -241,6 +256,11 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
       { .id = V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE, .value = 0},
     };
     for (auto ctrl : ctrls) {
+      if ((getenv("G8_AGNOS") != nullptr) && (ctrl.id == V4L2_CID_MPEG_VIDC_VIDEO_H264_CABAC_MODEL)) {
+        LOGW("G8_SKIP unsupported H264_CABAC_MODEL id=0x%08x value=%d", ctrl.id, ctrl.value);
+        continue;
+      }
+
       util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL failed");
     }
   }
@@ -251,9 +271,9 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
 
   // start encoder
   v4l2_buf_type buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  util::safe_ioctl(fd, VIDIOC_STREAMON, &buf_type, "VIDIOC_STREAMON failed");
+  util::safe_ioctl(fd, VIDIOC_STREAMON, &buf_type, "VIDIOC_STREAMON CAPTURE failed");
   buf_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-  util::safe_ioctl(fd, VIDIOC_STREAMON, &buf_type, "VIDIOC_STREAMON failed");
+  util::safe_ioctl(fd, VIDIOC_STREAMON, &buf_type, "VIDIOC_STREAMON OUTPUT failed");
 
   // queue up output buffers
   for (unsigned int i = 0; i < BUF_OUT_COUNT; i++) {
