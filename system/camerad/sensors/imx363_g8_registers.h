@@ -2,7 +2,7 @@
 
 // LG G8 ThinQ (alphalm) rear-main Sony IMX363 register tables.
 // Extracted from LG vendor com.qti.sensormodule.imx363.bin.
-// Initial bring-up mode: 2016x1136, RAW10, 4 CSI lanes, 30 fps.
+// Initial bring-up mode: 2016x1136, RAW10, 4 CSI lanes, 20 fps.
 // Probe: I2C write address 0x20, sensor ID register 0x0016, expected ID 0x0363.
 //
 // This file intentionally contains sensor register programming only.
@@ -59,8 +59,8 @@ const struct i2c_random_wr_payload mode_2016x1136_30_imx363_g8[] = {
   {0x0114, 0x03},
   {0x0220, 0x00},
   {0x0221, 0x11},
-  {0x0340, 0x06},
-  {0x0341, 0xa4},
+  {0x0340, 0x09},
+  {0x0341, 0xf6},
   {0x0342, 0x15},
   {0x0343, 0x90},
   {0x0381, 0x01},

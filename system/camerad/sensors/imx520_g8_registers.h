@@ -3,7 +3,7 @@
 // LG G8 ThinQ front RGB Sony IMX520.
 // Extracted directly from LG vendor com.qti.sensormodule.imx520.bin.
 // Donor SHA256: 589720f043df05cf7e15628d4ffee149007fb9a1f97e25097e072181f54e313e
-// Bring-up mode: 1640x924 @ 30.00 fps, RAW10, 2 lanes.
+// Bring-up mode: 1640x924 @ 20.00 fps, RAW10, 2 lanes.
 // Probe: I2C 0x20, ID reg 0x0016, expected 0x0520, FAST_PLUS.
 
 const struct i2c_random_wr_payload start_reg_array_imx520_g8[] = {
@@ -128,8 +128,8 @@ const struct i2c_random_wr_payload mode_1640x924_30_imx520_g8[] = {
   {0x0114, 0x01},
   {0x0220, 0x00},
   {0x0221, 0x11},
-  {0x0340, 0x0a},
-  {0x0341, 0x16},
+  {0x0340, 0x0f},
+  {0x0341, 0x21},
   {0x0342, 0x0f},
   {0x0343, 0x20},
   {0x0381, 0x01},
