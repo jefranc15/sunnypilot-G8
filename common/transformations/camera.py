@@ -1,4 +1,5 @@
 import itertools
+import os
 import numpy as np
 from dataclasses import dataclass
 
@@ -52,6 +53,9 @@ _ar_ox_config = DeviceCameraConfig(CameraConfig(1928, 1208, 2648.0), _ar_ox_fish
 _os_config = DeviceCameraConfig(CameraConfig(2688 // 2, 1520 // 2, 1522.0 * 3 / 4), _os_fisheye, _os_fisheye)
 _neo_config = DeviceCameraConfig(CameraConfig(1164, 874, 910.0), CameraConfig(816, 612, 650.0), _NoneCameraConfig())
 
+# LG G8 IMX363 road VisionIPC stream: measured 2016x1136 centered pinhole fit
+_g8_config = DeviceCameraConfig(CameraConfig(2016, 1136, 1550.943), _ar_ox_fisheye, _ar_ox_fisheye)
+
 DEVICE_CAMERAS = {
   # A "device camera" is defined by a device type and sensor
 
@@ -67,6 +71,9 @@ DEVICE_CAMERAS = {
   # simulator (emulates a tici)
   ("pc", "unknown"): _ar_ox_config,
 }
+if os.getenv("G8_AGNOS") == "1":
+  DEVICE_CAMERAS[("tici", "unknown")] = _g8_config
+
 prods = itertools.product(('tici', 'tizi', 'mici'), (('ar0231', _ar_ox_config), ('ox03c10', _ar_ox_config), ('os04c10', _os_config)))
 DEVICE_CAMERAS.update({(d, c[0]): c[1] for d, c in prods})
 
