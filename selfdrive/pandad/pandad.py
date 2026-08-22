@@ -15,20 +15,30 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.pandad.rivian_long_flasher import flash_rivian_long
 
 
-def get_expected_signature() -> bytes:
-  fn = os.path.join(FW_PATH, McuType.H7.config.app_fn)
-  return Panda.get_signature_from_firmware(fn)
+BLACK_PANDA_FW = os.path.join(BASEDIR, "g8/black_panda/panda.bin.signed")
+
+
+def get_expected_firmware(panda_type: bytes) -> str:
+  if panda_type == Panda.HW_TYPE_BLACK:
+    return BLACK_PANDA_FW
+  return os.path.join(FW_PATH, McuType.H7.config.app_fn)
+
+
+def get_expected_signature(panda_type: bytes) -> bytes:
+  return Panda.get_signature_from_firmware(get_expected_firmware(panda_type))
 
 def flash_panda(panda_serial: str):
   panda = Panda(panda_serial)
+  panda_type = panda.get_type()
 
   # skip flashing if the detected panda is not supported
-  if panda.get_type() not in Panda.SUPPORTED_DEVICES:
-    cloudlog.warning(f"Panda {panda_serial} is not supported (hw_type: {panda.get_type()}), skipping flash...")
+  if panda_type not in Panda.SUPPORTED_DEVICES:
+    cloudlog.warning(f"Panda {panda_serial} is not supported (hw_type: {panda_type}), skipping flash...")
     panda.close()
     return
 
-  fw_signature = get_expected_signature()
+  fw_fn = get_expected_firmware(panda_type)
+  fw_signature = get_expected_signature(panda_type)
   internal_panda = panda.is_internal()
 
   panda_version = "bootstub" if panda.bootstub else panda.get_version()
@@ -37,10 +47,12 @@ def flash_panda(panda_serial: str):
 
   if panda.bootstub or panda_signature != fw_signature:
     cloudlog.info("Panda firmware out of date, update required")
-    panda.flash()
+    panda.flash(fn=fw_fn)
     cloudlog.info("Done flashing")
 
   if panda.bootstub:
+    if panda_type == Panda.HW_TYPE_BLACK:
+      raise RuntimeError("Black Panda firmware did not boot; refusing automatic bootstub/DFU recovery")
     bootstub_version = panda.get_version()
     cloudlog.info(f"Flashed firmware not booting, flashing development bootloader. {bootstub_version=}, {internal_panda=}")
     if internal_panda:
@@ -72,6 +84,10 @@ def check_panda_support(panda_serials: list[str]) -> list[str]:
     panda.close()
     if is_internal:
       return [serial]
+
+  # LG G8 port has no built-in panda; use the sole external USB panda.
+  if len(panda_serials) == 1:
+    return panda_serials
 
   return []
 
@@ -129,7 +145,10 @@ def main() -> None:
 
         # run real pandad
         os.environ['MANAGER_DAEMON'] = 'pandad'
-        process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+        child_env = os.environ.copy()
+        if HARDWARE.__class__.__module__.endswith(".g8.hardware"):
+          child_env["G8_AGNOS"] = "1"
+        process = subprocess.Popen(["./pandad", panda_serials[0]], cwd=os.path.join(BASEDIR, "selfdrive/pandad"), env=child_env)
         process.wait()
     # TODO: wrap all panda exceptions in a base panda exception
     except (usb1.USBErrorNoDevice, usb1.USBErrorPipe):
@@ -140,6 +159,9 @@ def main() -> None:
     except Exception:
       cloudlog.exception("pandad.uncaught_exception")
 
+    # G8 has no internal Panda reset/recovery delay; prevent a hot retry loop.
+    if HARDWARE.__class__.__module__.endswith(".g8.hardware"):
+      time.sleep(1)
 
 if __name__ == "__main__":
   main()

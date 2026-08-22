@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <stdexcept>
 #include <vector>
@@ -13,8 +14,14 @@
 const bool PANDAD_MAXOUT = getenv("PANDAD_MAXOUT") != nullptr;
 
 Panda::Panda(std::string serial) {
-  handle = std::make_unique<PandaSpiHandle>(serial);
-  LOGW("connected to %s over SPI", serial.c_str());
+  // LG G8: prefer external USB panda, fall back to SPI for comma hardware.
+  try {
+    handle = std::make_unique<PandaUsbHandle>(serial);
+    LOGW("connected to %s over USB", serial.c_str());
+  } catch (std::exception &e) {
+    handle = std::make_unique<PandaSpiHandle>(serial);
+    LOGW("connected to %s over SPI", serial.c_str());
+  }
 
   hw_type = get_hw_type();
   can_reset_communications();
@@ -33,7 +40,13 @@ std::string Panda::hw_serial() {
 }
 
 std::vector<std::string> Panda::list() {
-  return PandaSpiHandle::list();
+  auto serials = PandaUsbHandle::list();
+  for (const auto &serial : PandaSpiHandle::list()) {
+    if (std::find(serials.begin(), serials.end(), serial) == serials.end()) {
+      serials.push_back(serial);
+    }
+  }
+  return serials;
 }
 
 void Panda::set_safety_model(cereal::CarParams::SafetyModel safety_model, uint16_t safety_param) {
@@ -177,6 +190,10 @@ void Panda::pack_can_buffer(const capnp::List<cereal::CanData>::Reader &can_data
       continue;
     }
     auto can_data = cmsg.getDat();
+    if ((hw_type == cereal::PandaState::PandaType::BLACK_PANDA) && (can_data.size() > 8)) {
+      LOGE("dropping CAN-FD frame for Black Panda: %zu bytes", can_data.size());
+      continue;
+    }
     uint8_t data_len_code = len_to_dlc(can_data.size());
     assert(can_data.size() <= 64);
     assert(can_data.size() == dlc_to_len[data_len_code]);

@@ -27,7 +27,13 @@ public:
       {"mici", cereal::InitData::DeviceType::MICI}
     };
     static const auto it = device_map.find(get_name());
-    assert(it != device_map.end());
+    if (it == device_map.end()) {
+      // LG G8 AGNOS port: use TICI behavior for hardware abstractions.
+      if (getenv("G8_AGNOS") != nullptr) {
+        return cereal::InitData::DeviceType::TICI;
+      }
+      assert(it != device_map.end());
+    }
     return it->second;
   }
 
