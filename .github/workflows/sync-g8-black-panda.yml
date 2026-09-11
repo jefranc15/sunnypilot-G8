@@ -1,0 +1,37 @@
+name: Sync G8 Black Panda DNGA firmware
+
+on:
+  push:
+    branches: [staging-tici]
+    paths:
+      - .github/workflows/sync-g8-black-panda.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: staging-tici
+
+      - name: Fetch verified Black Panda firmware
+        run: |
+          git clone --depth 1 --branch g8-black-dnga-fw https://github.com/jefranc15/panda.git /tmp/panda-fw
+          test -s /tmp/panda-fw/board/obj/panda.bin.signed
+          echo "0c5593ec168e58da51de7cd821146ff94e41d9aca515b6a9666eab2c10855abd  /tmp/panda-fw/board/obj/panda.bin.signed" | sha256sum -c -
+          strings /tmp/panda-fw/board/obj/panda.bin.signed | grep -q 'DEV-5dffe82b-DEBUG'
+          cp /tmp/panda-fw/board/obj/panda.bin.signed g8/black_panda/panda.bin.signed
+
+      - name: Commit firmware
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f g8/black_panda/panda.bin.signed
+          if ! git diff --cached --quiet; then
+            git commit -m "G8: update Black Panda firmware with DNGA safety"
+            git push origin HEAD:staging-tici
+          fi
