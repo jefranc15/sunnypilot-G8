@@ -11,6 +11,11 @@ class DngaSettings(BrandSettings):
   def __init__(self):
     super().__init__()
 
+    # ToggleSP reads BOOL params with get_bool(), which does not apply key defaults.
+    # Materialize the safe default so a fresh install always starts with Gear Check enabled.
+    if ui_state.params.get("DngaGearCheck") is None:
+      ui_state.params.put_bool("DngaGearCheck", True, block=True)
+
     self.gear_check_toggle = toggle_item_sp(
       tr("Gear Check"),
       tr("Require the vehicle to be in Drive before allowing engagement. Disable to allow SET while in Park or Neutral. Reverse remains blocked."),

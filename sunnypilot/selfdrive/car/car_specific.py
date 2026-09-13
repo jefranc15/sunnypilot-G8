@@ -24,7 +24,7 @@ class CarSpecificEventsSP:
     self.CP_SP = CP_SP
 
     self.low_speed_alert = False
-    self.dnga_gear_check = Params().get_bool("DngaGearCheck")
+    self.dnga_gear_check = Params().get("DngaGearCheck", return_default=True)
 
   def update(self, CS: structs.CarState, events: Events):
     events_sp = EventsSP()
