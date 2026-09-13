@@ -33,7 +33,7 @@ class DngaSettings(BrandSettings):
     )
     if not offroad:
       description = (
-        f"<b>{tr('Enable \"Always Offroad\" in Device panel, or turn vehicle off to toggle.')}</b><br><br>"
+        f'<b>{tr("Enable \"Always Offroad\" in Device panel, or turn vehicle off to toggle.")}</b><br><br>'
         f"{description}"
       )
 
