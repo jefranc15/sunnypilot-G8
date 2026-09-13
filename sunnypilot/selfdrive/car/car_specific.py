@@ -7,6 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 
 from cereal import log, custom
 from opendbc.car import structs
+from openpilot.common.params import Params
 
 from opendbc.car.chrysler.values import RAM_DT
 from openpilot.selfdrive.selfdrived.events import Events
@@ -23,9 +24,15 @@ class CarSpecificEventsSP:
     self.CP_SP = CP_SP
 
     self.low_speed_alert = False
+    self.dnga_gear_check = Params().get_bool("DngaGearCheck")
 
   def update(self, CS: structs.CarState, events: Events):
     events_sp = EventsSP()
+
+    # Match DragonPilot's optional gear check behavior for the DNGA port.
+    # Only remove wrongGear; reverseGear remains active and continues to block engagement in Reverse.
+    if self.CP.brand == 'dnga' and not self.dnga_gear_check and events.has(EventName.wrongGear):
+      events.remove(EventName.wrongGear)
 
     if self.CP.brand == 'chrysler':
       if self.CP.carFingerprint in RAM_DT:

@@ -125,6 +125,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "TeslaCoopSteering",
   ])
 
+  # dnga
+  keys.extend([
+    "DngaGearCheck",
+  ])
+
   # toyota
   keys.extend([
     "ToyotaEnforceStockLongitudinal",
