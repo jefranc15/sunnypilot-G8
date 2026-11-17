@@ -133,6 +133,43 @@ static cam_cmd_power *power_set_wait(cam_cmd_power *power, int16_t delay_ms) {
   return (struct cam_cmd_power *)(unconditional_wait + 1);
 }
 
+namespace {
+
+// Exact LGE SM8150 OIS userspace ABI. AGNOS' installed camera headers are
+// older than the G8 kernel and do not expose LGE's extra is_ois_aat byte.
+struct __attribute__((packed)) G8CamOisOpcode {
+  uint32_t prog;
+  uint32_t coeff;
+  uint32_t pheripheral;
+  uint32_t memory;
+};
+
+struct __attribute__((packed)) G8CamCmdOisInfo {
+  uint16_t slave_addr;
+  uint8_t i2c_freq_mode;
+  uint8_t cmd_type;
+  uint8_t ois_fw_flag;
+  uint8_t is_ois_calib;
+  uint8_t is_ois_aat;
+  char ois_name[32];
+  G8CamOisOpcode opcode;
+};
+
+static_assert(sizeof(G8CamCmdOisInfo) == 55);
+
+constexpr uint32_t G8_OIS_PACKET_OPCODE_INIT = 0;
+constexpr uint32_t G8_OIS_PACKET_OPCODE_CONTROL = 1;
+constexpr uint8_t G8_OIS_I2C_FAST_PLUS = 3;
+constexpr uint16_t G8_OIS_SLAVE_ADDR_8BIT = 0x7C;
+constexpr uint16_t G8_OIS_PWR_VAF = 4;
+constexpr uint16_t G8_OIS_PWR_CUSTOM_REG1 = 6;
+constexpr uint8_t G8_OIS_I2C_TYPE_DWORD = 4;
+constexpr uint8_t G8_OIS_WAIT_OP_COND = 1;
+constexpr uint32_t G8_OIS_READY_REG = 0xF100;
+constexpr uint32_t G8_OIS_MODE_REG = 0xF012;
+
+}  // namespace
+
 // *** MemoryManager ***
 
 void *MemoryManager::alloc_buf(int size, uint32_t *handle) {
@@ -1388,6 +1425,308 @@ void SpectraCamera::destroySyncObjectAt(int index) {
   destroy_sync_obj(m->cam_sync_fd, sync_objs_bps[index]);
 }
 
+bool SpectraCamera::g8_init_main_ois_centering() {
+  const bool requested =
+      getenv("G8_AGNOS") != nullptr &&
+      getenv("G8_MAIN_OIS_CENTER") != nullptr &&
+      cc.camera_num == 0 &&
+      cc.stream_type == VISION_STREAM_ROAD &&
+      getenv("G8_CAMERA_TARGET_WIDE") == nullptr &&
+      getenv("G8_CAMERA_TARGET_DRIVER") == nullptr;
+
+  if (!requested) return true;
+  if (g8_ois_dev_handle >= 0) return g8_ois_centered;
+
+  // Stock LG G8 alphaplus IMX363:
+  //   OIS      = OnSemi LC898124EP1
+  //   OIS node = cam-ois slot 0 (/dev/v4l-subdev22 on this device)
+  //   CCI      = master 0
+  //   slave    = 0x7C (8-bit CamX form -> SID 0x3E)
+  //   freq     = FAST_PLUS (1 MHz)
+  //
+  // This first experiment intentionally does NOT enable active OIS. It runs
+  // the kernel's exact LG LC898124EP1 DSP init, then applies the stock
+  // centering setting (ready poll + F012=0) so the optical axis is held still.
+  if (g8_ois_fd < 0) {
+    g8_ois_fd = open_v4l_by_name_and_index("cam-ois", 0);
+  }
+
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 OPEN fd=%d session=0x%X\n",
+          (int)g8_ois_fd, session_handle);
+  fflush(stderr);
+
+  if (g8_ois_fd < 0) {
+    fprintf(stderr, "G8_MAIN_OIS_CENTER_V1 OPEN_FAIL errno=%d\n", errno);
+    fflush(stderr);
+    return false;
+  }
+
+  auto ois_handle = device_acquire(g8_ois_fd, session_handle, nullptr);
+  if (!ois_handle) {
+    fprintf(stderr, "G8_MAIN_OIS_CENTER_V1 ACQUIRE_FAIL errno=%d\n", errno);
+    fflush(stderr);
+    return false;
+  }
+
+  g8_ois_dev_handle = *ois_handle;
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 ACQUIRE_OK handle=0x%X\n",
+          g8_ois_dev_handle);
+  fflush(stderr);
+
+  auto fail_and_release = [this](const char *stage, int ret, int saved_errno) {
+    fprintf(stderr,
+            "G8_MAIN_OIS_CENTER_V1 %s_FAIL ret=%d errno=%d\n",
+            stage, ret, saved_errno);
+    fflush(stderr);
+
+    if (g8_ois_dev_handle >= 0) {
+      int release_ret =
+          device_control(g8_ois_fd, CAM_RELEASE_DEV,
+                         session_handle, g8_ois_dev_handle);
+      fprintf(stderr,
+              "G8_MAIN_OIS_CENTER_V1 FAILURE_RELEASE ret=%d\n",
+              release_ret);
+      fflush(stderr);
+      g8_ois_dev_handle = -1;
+    }
+
+    g8_ois_centered = false;
+    return false;
+  };
+
+  // ---- INIT packet: slave info + exact LG two-rail power sequence ----
+  uint32_t init_packet_handle = 0;
+  const int init_packet_size =
+      sizeof(struct cam_packet) + 2 * sizeof(struct cam_cmd_buf_desc);
+
+  auto init_pkt =
+      m->mem_mgr.alloc<struct cam_packet>(
+          init_packet_size, &init_packet_handle);
+
+  init_pkt->header.op_code = G8_OIS_PACKET_OPCODE_INIT;
+  init_pkt->header.size = init_packet_size;
+  init_pkt->header.request_id = 0;
+  init_pkt->header.flags = 0;
+  init_pkt->header.padding = 0;
+  init_pkt->cmd_buf_offset = 0;
+  init_pkt->num_cmd_buf = 2;
+  init_pkt->io_configs_offset = 0;
+  init_pkt->num_io_configs = 0;
+  init_pkt->patch_offset = 0;
+  init_pkt->num_patches = 0;
+  init_pkt->kmd_cmd_buf_index = -1;
+  init_pkt->kmd_cmd_buf_offset = 0;
+
+  auto *init_desc =
+      reinterpret_cast<struct cam_cmd_buf_desc *>(&init_pkt->payload);
+
+  init_desc[0].offset = 0;
+  init_desc[0].size = init_desc[0].length = sizeof(G8CamCmdOisInfo);
+  init_desc[0].type = CAM_CMD_BUF_I2C;
+  init_desc[0].meta_data = 0;
+
+  auto ois_info =
+      m->mem_mgr.alloc<G8CamCmdOisInfo>(
+          init_desc[0].size,
+          reinterpret_cast<uint32_t *>(&init_desc[0].mem_handle));
+
+  ois_info->slave_addr = G8_OIS_SLAVE_ADDR_8BIT;
+  ois_info->i2c_freq_mode = G8_OIS_I2C_FAST_PLUS;
+  ois_info->cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
+  ois_info->ois_fw_flag = 0;
+  ois_info->is_ois_calib = 0;
+  ois_info->is_ois_aat = 0;
+  snprintf(ois_info->ois_name, sizeof(ois_info->ois_name), "%s",
+           "lc898124ep1");
+  // LG uses its in-kernel LC898124EP1 PM/DM downloader, not Qualcomm's
+  // generic .prog/.coeff path, so all generic firmware opcodes stay zero.
+
+  constexpr uint32_t OIS_POWER_ALLOC = 128;
+  init_desc[1].offset = 0;
+  init_desc[1].type = CAM_CMD_BUF_I2C;
+  init_desc[1].meta_data = 0;
+
+  auto power_buf =
+      m->mem_mgr.alloc<struct cam_cmd_power>(
+          OIS_POWER_ALLOC,
+          reinterpret_cast<uint32_t *>(&init_desc[1].mem_handle));
+
+  struct cam_cmd_power *power = power_buf.get();
+
+  // Stock power-up: VAF=1, wait 3 ms; CUSTOM_REG1=1, wait 10 ms.
+  power->count = 1;
+  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+  power->power_settings[0].power_seq_type = G8_OIS_PWR_VAF;
+  power->power_settings[0].config_val_low = 1;
+  power = power_set_wait(power, 3);
+
+  power->count = 1;
+  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+  power->power_settings[0].power_seq_type = G8_OIS_PWR_CUSTOM_REG1;
+  power->power_settings[0].config_val_low = 1;
+  power = power_set_wait(power, 10);
+
+  // Stock power-down: CUSTOM_REG1=0, wait 1 ms; VAF=0, wait 1 ms.
+  power->count = 1;
+  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+  power->power_settings[0].power_seq_type = G8_OIS_PWR_CUSTOM_REG1;
+  power->power_settings[0].config_val_low = 0;
+  power = power_set_wait(power, 1);
+
+  power->count = 1;
+  power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+  power->power_settings[0].power_seq_type = G8_OIS_PWR_VAF;
+  power->power_settings[0].config_val_low = 0;
+  power = power_set_wait(power, 1);
+
+  const uint32_t power_used =
+      static_cast<uint32_t>(
+          reinterpret_cast<char *>(power) -
+          reinterpret_cast<char *>(power_buf.get()));
+
+  if (power_used > OIS_POWER_ALLOC) {
+    return fail_and_release("POWER_OVERFLOW", -1, EOVERFLOW);
+  }
+
+  init_desc[1].size = init_desc[1].length = power_used;
+
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 INIT "
+          "slave=0x%02X sid=0x%02X freq=%u power_bytes=%u\n",
+          G8_OIS_SLAVE_ADDR_8BIT,
+          G8_OIS_SLAVE_ADDR_8BIT >> 1,
+          G8_OIS_I2C_FAST_PLUS,
+          power_used);
+  fflush(stderr);
+
+  errno = 0;
+  int init_ret =
+      device_config(g8_ois_fd, session_handle,
+                    g8_ois_dev_handle, init_packet_handle);
+  int init_errno = errno;
+
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 INIT_RET=%d ERRNO=%d\n",
+          init_ret, init_errno);
+  fflush(stderr);
+
+  if (init_ret != 0) {
+    return fail_and_release("INIT", init_ret, init_errno);
+  }
+
+  // ---- OIS_CONTROL: stock centeringOnSettings ----
+  // First wait until the LC898124 DSP reports ready at F100.
+  uint32_t control_packet_handle = 0;
+  const int control_packet_size =
+      sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc);
+
+  auto control_pkt =
+      m->mem_mgr.alloc<struct cam_packet>(
+          control_packet_size, &control_packet_handle);
+
+  control_pkt->header.op_code = G8_OIS_PACKET_OPCODE_CONTROL;
+  control_pkt->header.size = control_packet_size;
+  control_pkt->header.request_id = 0;
+  control_pkt->header.flags = 0;
+  control_pkt->header.padding = 0;
+  control_pkt->cmd_buf_offset = 0;
+  control_pkt->num_cmd_buf = 1;
+  control_pkt->io_configs_offset = 0;
+  control_pkt->num_io_configs = 0;
+  control_pkt->patch_offset = 0;
+  control_pkt->num_patches = 0;
+  control_pkt->kmd_cmd_buf_index = -1;
+  control_pkt->kmd_cmd_buf_offset = 0;
+
+  auto *control_desc =
+      reinterpret_cast<struct cam_cmd_buf_desc *>(&control_pkt->payload);
+
+  uint32_t poll_handle = 0;
+  auto poll =
+      m->mem_mgr.alloc<struct cam_cmd_conditional_wait>(
+          sizeof(struct cam_cmd_conditional_wait), &poll_handle);
+
+  poll->data_type = G8_OIS_I2C_TYPE_DWORD;
+  poll->addr_type = CAMERA_SENSOR_I2C_TYPE_WORD;
+  poll->op_code = G8_OIS_WAIT_OP_COND;
+  poll->cmd_type = CAMERA_SENSOR_CMD_TYPE_WAIT;
+  poll->timeout = 15;
+  poll->reserved = 0;
+  poll->reg_addr = G8_OIS_READY_REG;
+  poll->reg_data = 0;
+  poll->data_mask = 0xFFFFFFFF;
+
+  control_desc[0].mem_handle = poll_handle;
+  control_desc[0].offset = 0;
+  control_desc[0].size =
+      control_desc[0].length = sizeof(struct cam_cmd_conditional_wait);
+  control_desc[0].type = CAM_CMD_BUF_I2C;
+  control_desc[0].meta_data = 0;
+
+  errno = 0;
+  int poll_ret =
+      device_config(g8_ois_fd, session_handle,
+                    g8_ois_dev_handle, control_packet_handle);
+  int poll_errno = errno;
+
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 READY_POLL_RET=%d ERRNO=%d "
+          "reg=0x%04X expected=0\n",
+          poll_ret, poll_errno, G8_OIS_READY_REG);
+  fflush(stderr);
+
+  if (poll_ret != 0) {
+    return fail_and_release("READY_POLL", poll_ret, poll_errno);
+  }
+
+  // Then apply stock centering mode: 32-bit write F012 = 0.
+  uint32_t center_handle = 0;
+  auto center =
+      m->mem_mgr.alloc<struct cam_cmd_i2c_random_wr>(
+          sizeof(struct cam_cmd_i2c_random_wr), &center_handle);
+
+  center->header.count = 1;
+  center->header.op_code = 1;
+  center->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+  center->header.data_type = G8_OIS_I2C_TYPE_DWORD;
+  center->header.addr_type = CAMERA_SENSOR_I2C_TYPE_WORD;
+  center->header.reserved = 0;
+  center->random_wr_payload[0].reg_addr = G8_OIS_MODE_REG;
+  center->random_wr_payload[0].reg_data = 0;
+
+  control_desc[0].mem_handle = center_handle;
+  control_desc[0].offset = 0;
+  control_desc[0].size =
+      control_desc[0].length = sizeof(struct cam_cmd_i2c_random_wr);
+  control_desc[0].type = CAM_CMD_BUF_I2C;
+  control_desc[0].meta_data = 0;
+
+  errno = 0;
+  int center_ret =
+      device_config(g8_ois_fd, session_handle,
+                    g8_ois_dev_handle, control_packet_handle);
+  int center_errno = errno;
+
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 CENTER_RET=%d ERRNO=%d "
+          "reg=0x%04X val=0x00000000\n",
+          center_ret, center_errno, G8_OIS_MODE_REG);
+  fflush(stderr);
+
+  if (center_ret != 0) {
+    return fail_and_release("CENTER", center_ret, center_errno);
+  }
+
+  g8_ois_centered = true;
+  fprintf(stderr,
+          "G8_MAIN_OIS_CENTER_V1 READY centered=1 "
+          "active_ois=0 keep_acquired=1\n");
+  fflush(stderr);
+  return true;
+}
+
 void SpectraCamera::camera_map_bufs() {
   int ret;
   for (int i = 0; i < ife_buf_depth; i++) {
@@ -1993,6 +2332,15 @@ bool SpectraCamera::openSensor() {
     return false;
   }
 
+  // Opt-in first A/B experiment. OIS failure is intentionally non-fatal:
+  // fail_and_release() powers it back down and camera operation continues
+  // exactly as before.
+  if (!g8_init_main_ois_centering()) {
+    fprintf(stderr,
+            "G8_MAIN_OIS_CENTER_V1 FALLBACK baseline_camera_continues=1\n");
+    fflush(stderr);
+  }
+
   return true;
 }
 
@@ -2441,6 +2789,20 @@ void SpectraCamera::camera_close() {
       }
     }
     LOGD("released buffers");
+  }
+
+  // Keep the LC898124EP1 powered/centered for the full camera session.
+  // Release it before releasing the IMX363 sensor/session.
+  if (g8_ois_dev_handle >= 0) {
+    int ois_ret =
+        device_control(g8_ois_fd, CAM_RELEASE_DEV,
+                       session_handle, g8_ois_dev_handle);
+    fprintf(stderr,
+            "G8_MAIN_OIS_CENTER_V1 RELEASE ret=%d centered=%d\n",
+            ois_ret, g8_ois_centered ? 1 : 0);
+    fflush(stderr);
+    g8_ois_dev_handle = -1;
+    g8_ois_centered = false;
   }
 
   int ret = device_control(sensor_fd, CAM_RELEASE_DEV, session_handle, sensor_dev_handle);
