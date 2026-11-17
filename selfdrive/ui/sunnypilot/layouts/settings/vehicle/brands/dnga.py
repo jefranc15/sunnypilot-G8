@@ -11,10 +11,10 @@ class DngaSettings(BrandSettings):
   def __init__(self):
     super().__init__()
 
-    # ToggleSP reads BOOL params with get_bool(), which does not apply key defaults.
-    # Materialize the safe default so a fresh install always starts with Gear Check enabled.
+    # This DNGA port uses the gear-check bypass by default because the AC200 gear
+    # signal can fail to return to Drive reliably. Reverse remains independently blocked.
     if ui_state.params.get("DngaGearCheck") is None:
-      ui_state.params.put_bool("DngaGearCheck", True, block=True)
+      ui_state.params.put_bool("DngaGearCheck", False, block=True)
 
     self.gear_check_toggle = toggle_item_sp(
       tr("Gear Check"),
