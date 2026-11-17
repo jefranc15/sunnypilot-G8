@@ -154,6 +154,8 @@ public:
   void sensors_poke(int request_id);
   void sensors_i2c(const struct i2c_random_wr_payload* dat, int len, int op_code, bool data_word);
 
+  bool g8_init_main_ois_centering();
+
   bool openSensor();
   void configISP();
   void configICP();
@@ -180,12 +182,15 @@ public:
 
   unique_fd sensor_fd;
   unique_fd csiphy_fd;
+  unique_fd g8_ois_fd;
 
   int32_t session_handle = -1;
   int32_t sensor_dev_handle = -1;
   int32_t isp_dev_handle = -1;
   int32_t icp_dev_handle = -1;
   int32_t csiphy_dev_handle = -1;
+  int32_t g8_ois_dev_handle = -1;
+  bool g8_ois_centered = false;
 
   int32_t link_handle = -1;
 
