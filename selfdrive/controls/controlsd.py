@@ -28,6 +28,15 @@ LaneChangeDirection = log.LaneChangeDirection
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
+# DNGA Yaris Cross: suppress tiny model-action curvature chatter only while
+# driving nearly straight. Larger curvature requests bypass this filter so
+# normal cornering and lane-change response remain unchanged.
+DNGA_STRAIGHT_CURVATURE_MAX = 0.0015  # 1/m, ~667 m radius
+DNGA_CURVATURE_DEADBAND = 0.00003     # 1/m, ignores very small centering changes
+DNGA_CURVATURE_FILTER_TAU = 0.18      # seconds
+DNGA_CURVATURE_FILTER_MIN_SPEED = 5.0 # m/s
+
+
 
 class Controls(ControlsExt):
   def __init__(self) -> None:
@@ -50,6 +59,7 @@ class Controls(ControlsExt):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.dnga_curvature_filtered = 0.0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -136,9 +146,39 @@ class Controls(ControlsExt):
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
     if self.sm.valid['lateralManeuverPlan']:
+      # Never filter explicit maneuver curvature.
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
+      if self.CP.brand == "dnga":
+        self.dnga_curvature_filtered = new_desired_curvature
     else:
-      new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      raw_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      new_desired_curvature = raw_desired_curvature
+
+      if self.CP.brand == "dnga":
+        near_straight = (
+          abs(raw_desired_curvature) < DNGA_STRAIGHT_CURVATURE_MAX
+          and abs(self.dnga_curvature_filtered) < DNGA_STRAIGHT_CURVATURE_MAX
+        )
+        filter_active = (
+          CC.latActive
+          and CS.vEgo >= DNGA_CURVATURE_FILTER_MIN_SPEED
+          and near_straight
+        )
+
+        if not filter_active:
+          # Track the real request immediately outside the straight-road window
+          # so the filter cannot add lag when entering or leaving a real curve.
+          self.dnga_curvature_filtered = raw_desired_curvature
+        else:
+          delta = raw_desired_curvature - self.dnga_curvature_filtered
+          if abs(delta) > DNGA_CURVATURE_DEADBAND:
+            # Remove only the tiny oscillatory portion before low-pass filtering.
+            target = raw_desired_curvature - math.copysign(DNGA_CURVATURE_DEADBAND, delta)
+            alpha = 1.0 - math.exp(-DT_CTRL / DNGA_CURVATURE_FILTER_TAU)
+            self.dnga_curvature_filtered += alpha * (target - self.dnga_curvature_filtered)
+
+        new_desired_curvature = self.dnga_curvature_filtered
+
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
